@@ -107,8 +107,16 @@ npm install
 }
 ```
 
-### 4. （强烈推荐）挂载全局大脑分流规则
-将 [`delegate-to-dsh.md`](./delegate-to-dsh.md) 复制到 `~/.gemini/config/rules/delegate-to-dsh.md`。挂载后无需在对话中手动提及 DeepSeek，Antigravity 大脑也会自动按难度判别、自动绑定 `sessionKey` 吃满缓存并并发调遣外包军团。
+### 4. （必装：激活默认主动外包与强制拆单）安装全局编排插件
+> **⚠️ Antigravity 2.0 避坑重点**：在 Antigravity 2.0 插件化架构下，散装放在 `~/.gemini/config/rules/*.md` 的规则文件会被 Language Server 静默忽略！全局规则**必须**封装在 `~/.gemini/config/plugins/<插件名>/rules/AGENTS.md` 中才会 100% 注入 `<user_rules>`。
+
+使用本仓库附带的 `plugin.json` 与 `delegate-to-dsh.md` 创建 `dsh-deepseek-delegator` 全局插件，即可彻底激活**「新会话无需提醒默认主动外包」**与**「>120 行或 ≥2 模块严禁整包甩锅、强制拆成 2~4 个子任务走 `delegate_parallel` 并发」**的两大铁律：
+
+```bash
+mkdir -p ~/.gemini/config/plugins/dsh-deepseek-delegator/rules
+cp plugin.json ~/.gemini/config/plugins/dsh-deepseek-delegator/plugin.json
+cp delegate-to-dsh.md ~/.gemini/config/plugins/dsh-deepseek-delegator/rules/AGENTS.md
+```
 
 ---
 

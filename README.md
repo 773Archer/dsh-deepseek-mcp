@@ -107,8 +107,16 @@ Add `dsh-deepseek` to `~/.gemini/config/mcp_config.json` (or `~/.gemini/antigrav
 }
 ```
 
-### 4. (Recommended) Add the Global Orchestrator Rule
-Copy [`delegate-to-dsh.md`](./delegate-to-dsh.md) to `~/.gemini/config/rules/delegate-to-dsh.md` so Antigravity automatically triages tasks, reuses `sessionKey`s within the same workflow, and fans out leaf tasks via `delegate_parallel`.
+### 4. (Required for Auto-Delegation) Install the Global Orchestrator Plugin
+In **Google Antigravity 2.0**, loose files in `~/.gemini/config/rules/` are ignored after plugin migration—global rules **must** live inside an enabled plugin (`~/.gemini/config/plugins/<name>/rules/AGENTS.md`).
+
+Install the bundled `dsh-deepseek-delegator` plugin so Antigravity **proactively delegates without waiting to be asked** and **enforces multi-part decomposition via `delegate_parallel`** (forbidding monolithic single-task dumps on any task `>120` lines or `>=2` modules):
+
+```bash
+mkdir -p ~/.gemini/config/plugins/dsh-deepseek-delegator/rules
+cp plugin.json ~/.gemini/config/plugins/dsh-deepseek-delegator/plugin.json
+cp delegate-to-dsh.md ~/.gemini/config/plugins/dsh-deepseek-delegator/rules/AGENTS.md
+```
 
 ---
 

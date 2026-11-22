@@ -405,7 +405,7 @@ server.tool('worker_info', '返回 worker 配置、难度档、三级计时与�
 
 server.tool(
   'delegate_task',
-  '把可独立完成的子任务交给 DeepSeek worker（同步返回，附带实时 Token 消耗与人民币费用估算）。同轮任务/同批子任务传相同 sessionKey 复用会话；无关新任务换新 key 或省略（每次全新、不污染）。纯文本/代码生成任务可传 pureText:true 禁用工具调用以大幅提速省 Token。',
+  '【仅限单一原子级叶子任务！严禁整包甩锅】把不可再拆的单个原子子任务交给 DeepSeek worker（同步返回，附带实时 Token 消耗与人民币费用估算）。警告：若用户任务预计产出 >120 行代码或包含 ≥2 个独立模块/组件/场景/文件，绝对禁止将整个任务原样塞进单次 delegate_task，必须先由你（大脑）设计接口契约并拆成 2~4 个互不重叠的子任务改调 delegate_parallel 并发外包！纯文本/代码片段生成可传 pureText:true 禁用本地工具自检以大幅提速。',
   {
     task: z.string().describe('要 DeepSeek worker 执行的自然语言任务（越具体越好）'),
     cwd: z.string().optional().describe('工作目录（绝对路径）；默认自动回退到工作区目录（Windows 路径大小写/斜杠自动归一化）'),
@@ -430,7 +430,7 @@ server.tool(
 
 server.tool(
   'delegate_parallel',
-  '一次把"一个任务拆出的多条子任务"并发外包给 DeepSeek worker（服务端并发 + 并发上限，统一返回全文及汇总 Token 账单）。每条可单独配 sessionKey/tier/cwd/pureText/reasoningEffort/超时；共享同一 sessionKey 的条目会自动排队串行并共享上下文，不同 key 才是真并行。',
+  '【中大型/多模块任务首选】将大脑拆解出的 2~16 条独立叶子子任务一次性并发外包给多个 DeepSeek worker（服务端真并行 + 统一返回全文及汇总 Token 账单）。注意：要并行执行的各子任务必须传不同的 sessionKey（如 sub-1, sub-2, sub-3），因为共享同一 sessionKey 的条目会排队串行！纯代码/SVG/文本片段生成建议设 pureText:true 防过度调工具自嗨。',
   {
     tasks: z.array(z.object({
       task: z.string().describe('该子任务内容'),
