@@ -1,0 +1,35 @@
+{
+  "name": "dsh-deepseek-mcp",
+  "version": "2.5.0",
+  "type": "module",
+  "description": "Persistent-session DeepSeek worker pool MCP server for Google Antigravity & AI IDEs, backed by DeepSeek Harness (DSH) SDK JSON-RPC with multi-worker parallel fan-out, 3-tier wall-clock timers, KV cache reuse, and real-time token/cost accounting.",
+  "main": "server.mjs",
+  "bin": {
+    "dsh-deepseek-mcp": "./server.mjs"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "selftest": "node server.mjs --selftest",
+    "test:timeout": "node server.mjs --timeout-test",
+    "test:ladder": "node server.mjs --ladder-test",
+    "test:e2e": "node e2e_test.mjs",
+    "test:reuse": "node e2e_reuse.mjs",
+    "test:parallel": "node e2e_parallel.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "deepseek",
+    "dsh",
+    "deepseek-harness",
+    "antigravity",
+    "agent-delegation",
+    "worker-pool",
+    "kv-cache"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "zod": "^3.25.76"
+  }
+}
