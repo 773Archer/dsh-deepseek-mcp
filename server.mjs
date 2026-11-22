@@ -430,7 +430,7 @@ server.tool(
 
 server.tool(
   'delegate_parallel',
-  '【中大型/多模块任务首选】将大脑拆解出的 2~16 条独立叶子子任务一次性并发外包给多个 DeepSeek worker（服务端真并行 + 统一返回全文及汇总 Token 账单）。注意：要并行执行的各子任务必须传不同的 sessionKey（如 sub-1, sub-2, sub-3），因为共享同一 sessionKey 的条目会排队串行！纯代码/SVG/文本片段生成建议设 pureText:true 防过度调工具自嗨。',
+  '【中大型/多模块任务首选｜严禁单次过载】将大脑拆解出的 2~4 条独立叶子子任务一次性并发外包给多个 DeepSeek worker（服务端真并行 + 统一返回全文及汇总 Token 账单）。⚠️ 超大型任务（>4 个单元/地图/场景/模块）严禁把多个单元打包塞给同一个 worker，也严禁在单次 delegate_parallel 中塞入超过 4 个重任务导致集体超时！每个子任务单轮最多只允许生成 1~2 个场景/模块（≤350 行代码），当总单元数 N > 4（例如 20 个地图）时，必须拆成多次（Multi-Wave）delegate_parallel 分波次滚动调用（每波 4 个并发任务，跨波次复用 worker-1~worker-4 的 sessionKey 以命中 98% KV 缓存）！同一波次内要并行执行的子任务必须传不同的 sessionKey；纯代码/SVG 片段生成建议设 pureText:true。',
   {
     tasks: z.array(z.object({
       task: z.string().describe('该子任务内容'),

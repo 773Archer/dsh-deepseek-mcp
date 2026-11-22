@@ -110,7 +110,7 @@ npm install
 ### 4. （必装：激活默认主动外包与强制拆单）安装全局编排插件
 > **⚠️ Antigravity 2.0 避坑重点**：在 Antigravity 2.0 插件化架构下，散装放在 `~/.gemini/config/rules/*.md` 的规则文件会被 Language Server 静默忽略！全局规则**必须**封装在 `~/.gemini/config/plugins/<插件名>/rules/AGENTS.md` 中才会 100% 注入 `<user_rules>`。
 
-使用本仓库附带的 `plugin.json` 与 `delegate-to-dsh.md` 创建 `dsh-deepseek-delegator` 全局插件，即可彻底激活**「新会话无需提醒默认主动外包」**与**「>120 行或 ≥2 模块严禁整包甩锅、强制拆成 2~4 个子任务走 `delegate_parallel` 并发」**的两大铁律：
+使用本仓库附带的 `plugin.json` 与 `delegate-to-dsh.md` 创建 `dsh-deepseek-delegator` 全局插件，即可彻底激活三大铁律：**「新会话无需提醒默认主动外包」**、**「>120 行或 ≥2 模块严禁整包甩锅、强制走 `delegate_parallel` 并发」**，以及**「超大型任务（>4 个单元/地图/场景）严禁单次捆绑过载，必须限制单工人单轮只做 1~2 个单元，并拆成多波次（Multi-Wave）滚动调用 `delegate_parallel(4)` + 跨波次复用 `sessionKey` 吃满 98% KV 缓存」**：
 
 ```bash
 mkdir -p ~/.gemini/config/plugins/dsh-deepseek-delegator/rules
