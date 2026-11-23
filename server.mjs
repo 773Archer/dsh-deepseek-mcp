@@ -1,23 +1,34 @@
 #!/usr/bin/env node
-// Stdio MCP server (v2.5.0): persistent-session DeepSeek worker pool for an MCP client (Antigravity).
+// Stdio MCP server (v3.0.0): persistent-session DeepSeek worker pool for an MCP client (Antigravity).
 // Backed by DSH's official SDK JSON-RPC server (`dsh --profile sdk`).
 //
-// Key features & v2.5.0 upgrades:
-//   - Race-free session pool: `busy: true` and `initPromise` are registered synchronously before `await s.start()`,
-//     fixing the self-eviction bug when concurrency > POOL_MAX and preventing duplicate orphan processes on same-key races.
-//   - Deferred LRU eviction: `evictLRU()` runs both on creation and in `finally` after `rec.busy = false`.
-//   - Windows path normalization & safe default CWD: `D:\agy` and `d:/agy` share the same pool key; avoids falling back to IDE binary dir.
-//   - Windows process-tree cleanup: `taskkill /PID <pid> /T /F` kills child PowerShell / headless browser processes on timeout or eviction.
-//   - Real-time Token & Cost accounting: extracts `usage` from `assistant/message` stream events and reports `usage`, `costCNY`, `elapsedMs`.
-//   - `pureText` mode & `reasoningEffort` ('low' | 'high' | 'max'): prevents unnecessary tool-call loops on pure generation tasks.
+// Key features & v3.0.0 upgrades:
+//   - Three-tier execution modes (`mode: 'fast' | 'craft' | 'agent'`): decouples tool-isolation from output depth,
+//     giving high-craft single-turn generation (`craft`) without agentic tool-loop runaway.
+//   - Physical worker profile isolation (`worker-clean.patch.yml` + `worker-pure.patch.yml`): strips personal
+//     ~/.dsh/AGENTS.md and irrelevant skills, cutting base input bloat from ~9.4k tokens down to ~520 tokens.
+//   - Stream-aware stall watchdog (`stallTimeoutMs`), single-turn completion gate, and automatic 1x failover
+//     onto another healthy Magpie route on stall/crash.
+//   - Two-pass KV-cached craft + polish workflow: `fast` and `craft` share the same warm `sessionKey` pool bucket
+//     so Pass-2 targeted critique/polish hits ~95-98% KV cache (`cacheHitRate` reported on every response).
+//   - Magpie credit-aware direct route spreading (editable in `MAGPIE_DIRECT_ROUTES` below).
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
-import { spawn } from 'node:child_process'
+import { spawn, execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { randomUUID } from 'node:crypto'
-import { resolve as resolvePath, join as joinPath } from 'node:path'
+import { resolve as resolvePath, join as joinPath, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
+
+const execFileAsync = promisify(execFile)
+const HERE_DIR = dirname(fileURLToPath(import.meta.url))
+const CLEAN_PATCH = joinPath(HERE_DIR, 'worker-clean.patch.yml')
+const PURE_PATCH = joinPath(HERE_DIR, 'worker-pure.patch.yml')
+const ISOLATE_WORKER = process.env.DSH_WORKER_ISOLATE !== '0'
+const SERVER_VERSION = '3.0.0'
 
 const NODE_EXE = process.env.DSH_NODE || process.execPath
 const DEFAULT_DSH_BIN = joinPath(homedir(), 'nodejs/node_modules/@deepseek-ai/dsh/lib/bin.js').replace(/\\/g, '/')
@@ -35,9 +46,162 @@ const POOL_TTL = Number(process.env.POOL_TTL_MS || 1800000)
 const MAX_TURNS = Number(process.env.MAX_TURNS || 40)
 const DEFAULT_WORKSPACE = process.env.DEFAULT_WORKSPACE_CWD || (existsSync('d:\\agy') ? 'd:\\agy' : process.cwd())
 
+const MODE_PRESETS = {
+  fast: {
+    tools: false,
+    defaultEffort: 'low',
+    defaultStallMs: 60000,
+    defaultTimeoutMs: 120000,
+    singleStepGate: true,
+    desc: '极速纯输出（禁工具 + 浅思考，适合样板/配置/小片段/Pass-2 快速定点精修，10~25s）',
+  },
+  craft: {
+    tools: false,
+    defaultEffort: 'low',
+    defaultStallMs: 120000,
+    defaultTimeoutMs: 240000,
+    singleStepGate: true,
+    desc: '精工纯输出甜品档（禁工具防死循环 + 隔离冗余上下文 + 高完整度代码/艺术渲染，20~60s；极难算法可显式传 reasoningEffort:"high"）',
+  },
+  agent: {
+    tools: true,
+    defaultEffort: 'high',
+    defaultStallMs: 120000,
+    defaultTimeoutMs: TURN_TIMEOUT,
+    singleStepGate: false,
+    desc: '完整自治代理（开启 shell/fs 工具 + 隔离个人 AGENTS.md，适合真实仓库排障与测试）',
+  },
+}
+
+function resolveMode(mode, pureText, reasoningEffort) {
+  if (mode && MODE_PRESETS[mode]) return mode
+  if (pureText === true) return reasoningEffort === 'low' ? 'fast' : 'craft'
+  return 'agent'
+}
+
 const TIERS = {
-  flash: { model: 'auto/deepseek-v4.1-flash', desc: '便宜快，适合简单/叶子任务（默认）' },
-  max: { model: 'trae-cn/deepseek-v4.1-flash-max', desc: '更强、1M 上下文，适合偏重但仍可独立完成的子任务' },
+  flash: { model: 'auto/deepseek-v4.1-flash', desc: '便宜快，适合简单/叶子任务（多路并发时自动分散到各 Magpie 独立路线并检查积分）' },
+  max: { model: 'trae-cn/deepseek-v4.1-flash-max', desc: '更强、1M 上下文，适合偏重但仍可独立完成的子任务（积分不足时自动切高上下文健康路线）' },
+}
+
+// Magpie direct routes (bypassing routing group `auto/deepseek-v4.1-flash` during multi-way concurrency).
+// Note: `doubaowork-direct` (32k ctx / 4096 maxTokens) stalls under DSH's ~9.4k system prompt, so it is fallback-only (`dshPrimary: false`).
+const MAGPIE_DIRECT_ROUTES = [
+  { provider: 'workbuddy',         model: 'workbuddy/deepseek-v4.1-flash',                       minPct: 5, minAbs: 50, maxTokens: 128000, highCtx: true,  dshPrimary: true  },
+  { provider: 'wps-lingxi',        model: 'wps-lingxi/deepseek-v4.1-flash',                      minPct: 5, minAbs: 50, maxTokens: 393216, highCtx: true,  dshPrimary: true  },
+  { provider: 'trae-cn',           model: 'trae-cn/deepseek-v4.1-flash',                         minPct: 5, minAbs: 50, maxTokens: 16000,  highCtx: false, dshPrimary: true  },
+  { provider: 'doubaowork-direct', model: 'doubaowork-direct/person-deepseek-v4-1-flash-261017', minPct: 5, minAbs: 20, maxTokens: 4096,   highCtx: false, dshPrimary: false },
+]
+const MAGPIE_MAX_ROUTES = [
+  { provider: 'trae-cn',           model: 'trae-cn/deepseek-v4.1-flash-max',                     minPct: 5, minAbs: 50, maxTokens: 64000,  highCtx: true },
+  { provider: 'wps-lingxi',        model: 'wps-lingxi/deepseek-v4.1-flash',                      minPct: 5, minAbs: 50, maxTokens: 393216, highCtx: true },
+  { provider: 'workbuddy',         model: 'workbuddy/deepseek-v4.1-flash',                       minPct: 5, minAbs: 50, maxTokens: 128000, highCtx: true },
+]
+const QUOTA_CACHE_TTL_MS = Number(process.env.MAGPIE_QUOTA_TTL_MS || 60000)
+let _quotaCache = { ts: 0, entries: null, error: null }
+let _routeRR = 0
+
+function pickPrimaryQuotaWindow(windows) {
+  if (!Array.isArray(windows) || !windows.length) return null
+  const totalWin = windows.find((w) => /total\s*credits/i.test(String(w?.name || '')))
+  if (totalWin) return totalWin
+  return windows.find((w) => w && w.lane !== 'images' && !/tokens|image/i.test(String(w.name || ''))) || windows[0]
+}
+
+function evalAccountCredit(item, route) {
+  const w = pickPrimaryQuotaWindow(item?.windows)
+  if (!w) return { user: item?.user || 'default', remainingPct: null, remainingAbs: null, unit: '', healthy: true, reason: 'no-window' }
+  const remainingPct = typeof w.remaining === 'number' ? Number(w.remaining.toFixed(2)) : null
+  let remainingAbs = null
+  if (typeof w.balance === 'number') remainingAbs = w.balance
+  else if (typeof w.limit === 'number' && typeof w.amount === 'number') remainingAbs = Math.max(0, w.limit - w.amount)
+  else if (typeof w.runsOut === 'number') remainingAbs = w.runsOut
+  if (remainingAbs !== null) remainingAbs = Number(remainingAbs.toFixed(2))
+  const pctOk = remainingPct === null || remainingPct >= route.minPct
+  const absOk = remainingAbs === null || remainingAbs >= route.minAbs
+  const healthy = pctOk && absOk
+  const reason = healthy ? 'ok' : (!pctOk ? `pct ${remainingPct}% < ${route.minPct}%` : `abs ${remainingAbs} < ${route.minAbs}`)
+  return { user: item?.user || 'default', window: w.name, remainingPct, remainingAbs, unit: w.unit || '', healthy, reason }
+}
+
+async function fetchMagpieQuotas(force = false) {
+  const now = Date.now()
+  if (!force && _quotaCache.entries && now - _quotaCache.ts < QUOTA_CACHE_TTL_MS) {
+    return _quotaCache
+  }
+  try {
+    const { stdout } = await execFileAsync('magpie', ['quota', '--json'], { timeout: 15000, windowsHide: true })
+    const startIdx = stdout.indexOf('[')
+    if (startIdx < 0) throw new Error('no JSON array in magpie quota output')
+    const entries = JSON.parse(stdout.slice(startIdx))
+    _quotaCache = { ts: now, entries, error: null }
+    return _quotaCache
+  } catch (e) {
+    log('magpie quota check failed:', String(e))
+    _quotaCache = { ts: now, entries: _quotaCache.entries, error: String(e) }
+    return _quotaCache
+  }
+}
+
+async function inspectMagpieRoutes(candidates = MAGPIE_DIRECT_ROUTES, force = false) {
+  const q = await fetchMagpieQuotas(force)
+  const byProvider = new Map()
+  if (Array.isArray(q.entries)) {
+    for (const item of q.entries) {
+      const p = String(item?.provider || '')
+      if (!p) continue
+      if (!byProvider.has(p)) byProvider.set(p, [])
+      byProvider.get(p).push(item)
+    }
+  }
+  const evaluated = candidates.map((route) => {
+    const accs = byProvider.get(route.provider)
+    if (!accs || !accs.length) {
+      return { ...route, eligible: !q.entries, healthyAccounts: 0, accounts: [], skipReason: q.entries ? 'provider-not-found' : 'quota-unavailable' }
+    }
+    const accounts = accs.map((a) => evalAccountCredit(a, route))
+    const healthyAccounts = accounts.filter((a) => a.healthy).length
+    return {
+      ...route,
+      eligible: healthyAccounts > 0,
+      healthyAccounts,
+      accounts,
+      skipReason: healthyAccounts > 0 ? null : accounts.map((a) => `${a.user}:${a.reason}`).join('; '),
+    }
+  })
+  return { evaluated, eligible: evaluated.filter((r) => r.eligible), quotaError: q.error, checkedAt: _quotaCache.ts }
+}
+
+// Build a round-robin list of distinct direct Magpie routes for N concurrent tasks.
+// Distinct primary high-context providers come first (skipping low-credit routes & low-context fallback routes when primary routes exist).
+async function planDirectRoutes(count, tierName = 'flash') {
+  const candidates = tierName === 'max' ? MAGPIE_MAX_ROUTES : MAGPIE_DIRECT_ROUTES
+  const report = await inspectMagpieRoutes(candidates)
+  const primaryEligible = report.eligible.filter((r) => r.dshPrimary !== false)
+  const eligible = primaryEligible.length ? primaryEligible : report.eligible
+  if (!eligible.length) {
+    return {
+      models: Array.from({ length: count }, () => TIERS[tierName]?.model || TIERS.flash.model),
+      report,
+      fallback: true,
+    }
+  }
+  // Construct weighted distinct-first rotation order:
+  // Round 1: every eligible provider once (true distinct-route spread)
+  // Round 2+: providers with multiple healthy accounts (e.g. workbuddy with 2 accounts) before repeating single-account ones
+  const order = []
+  for (const r of eligible) order.push(r)
+  const multiAcc = eligible.filter((r) => r.healthyAccounts > 1)
+  for (const r of multiAcc) {
+    for (let k = 1; k < r.healthyAccounts; k++) order.push(r)
+  }
+  const models = []
+  for (let i = 0; i < count; i++) {
+    const picked = order[(_routeRR + i) % order.length]
+    models.push(picked.model)
+  }
+  _routeRR = (_routeRR + count) % order.length
+  return { models, report, fallback: false }
 }
 
 const VALID_EFFORTS = new Set(['low', 'high', 'max'])
@@ -76,6 +240,8 @@ function enrichUsageWithCost(u) {
   const missM = (u.uncachedInputTokens + u.cacheWriteTokens) / 1e6
   const hitM = u.cacheReadTokens / 1e6
   const outM = u.outputTokens / 1e6
+  const totalIn = u.uncachedInputTokens + u.cacheWriteTokens + u.cacheReadTokens
+  const cacheHitRate = totalIn > 0 ? Number(((u.cacheReadTokens / totalIn) * 100).toFixed(1)) : 0
   const offPeak = isOffPeakBeijing()
   // Official DeepSeek-V4.1-Flash: Peak (2.00 / 0.04 / 8.00 CNY), Off-Peak 50% (1.00 / 0.02 / 4.00 CNY)
   const offPeakCNY = missM * 1.00 + hitM * 0.02 + outM * 4.00
@@ -83,6 +249,7 @@ function enrichUsageWithCost(u) {
   const magpieCredits = missM * 57.7075 + hitM * 1.1507 + outM * 231.0054
   return {
     ...u,
+    cacheHitRate,
     isOffPeak: offPeak,
     estimatedCostCNY: Number((offPeak ? offPeakCNY : peakCNY).toFixed(6)),
     offPeakCostCNY: Number(offPeakCNY.toFixed(6)),
@@ -131,27 +298,33 @@ function extractEventUsage(ev) {
 }
 
 class SdkSession {
-  constructor({ cwd, model, reasoningEffort = 'high' }) {
+  constructor({ cwd, model, reasoningEffort = 'high', tools = true }) {
     this.cwd = cwd
     this.model = model
+    this.tools = tools !== false
     this.reasoningEffort = VALID_EFFORTS.has(reasoningEffort) ? reasoningEffort : 'high'
     this.sessionId = 'sess-' + randomUUID()
     this.child = null; this.buf = ''; this.err = ''; this.nextId = 1
     this.pending = new Map(); this.sawRunning = false; this.doneResolve = null
     this.acc = ''; this.toolCalls = []; this.dead = false; this.lastStatus = 'new'
+    this.lastActivityAt = Date.now()
+    this.singleStepGate = false
     this.turnUsage = zeroUsage()
     this.totalUsage = zeroUsage()
     this._lastStepUsageKey = null
     this.lock = Promise.resolve()
   }
   async start() {
-    this.child = spawn(NODE_EXE, [DSH_BIN, '--profile', PROFILE], { cwd: this.cwd, env: process.env, windowsHide: true })
+    const args = [DSH_BIN, '--profile', PROFILE]
+    if (ISOLATE_WORKER && existsSync(CLEAN_PATCH)) args.push('--patch', CLEAN_PATCH)
+    if (ISOLATE_WORKER && !this.tools && existsSync(PURE_PATCH)) args.push('--patch', PURE_PATCH)
+    this.child = spawn(NODE_EXE, args, { cwd: this.cwd, env: process.env, windowsHide: true })
     this.child.stdout.on('data', (d) => this._onData(d))
     this.child.stderr.on('data', (d) => { this.err = (this.err + d.toString()).slice(-4000) })
     this.child.on('close', (code) => { this.dead = true; this._failAll(new Error(`sdk child closed code=${code} :: ${this.err.slice(-600)}`)) })
     this.child.on('error', (e) => { this.dead = true; this._failAll(e) })
-    await this.request('initialize', { cwd: this.cwd, provider: 'magpie', model: this.model, reasoningEffort: this.reasoningEffort })
-    log('session started', this.sessionId, 'model=', this.model, 'effort=', this.reasoningEffort, 'cwd=', this.cwd)
+    await this.request('initialize', { cwd: this.cwd, provider: 'magpie', model: this.model, reasoningEffort: this.reasoningEffort }, 45000)
+    log('session started', this.sessionId, 'model=', this.model, 'effort=', this.reasoningEffort, 'tools=', this.tools, 'isolated=', ISOLATE_WORKER, 'cwd=', this.cwd)
   }
   _onData(d) {
     this.buf += d.toString(); let nl
@@ -167,13 +340,16 @@ class SdkSession {
   }
   _onNotif(method, p) {
     if (method === 'session.status') {
-      const st = String(p.status); this.lastStatus = st
+      const st = String(p.status); this.lastStatus = st; this.lastActivityAt = Date.now()
       if (/running/i.test(st)) this.sawRunning = true
       else if (this.sawRunning && this.doneResolve && /idle|done|stop|complete|error|fail/i.test(st)) {
         const r = this.doneResolve; this.doneResolve = null; r(st)
       }
     } else if (method === 'session.event') {
       const ev = p.event || {}
+      if (ev.type === 'step/start' || ev.type === 'assistant/message' || ev.type === 'assistant/attempt' || ev.type === 'tool/call' || ev.type === 'step/end' || ev.type === 'turn/end') {
+        this.lastActivityAt = Date.now()
+      }
       if (ev.type === 'assistant/message') {
         const content = ev.data?.message?.content
         if (Array.isArray(content)) {
@@ -191,6 +367,10 @@ class SdkSession {
           addUsage(this.turnUsage, u)
           addUsage(this.totalUsage, u)
         }
+      }
+      // Single-turn completion gate for `fast`/`craft` modes: once step 1 emits real text and ends without tool calls, resolve cleanly!
+      if (this.singleStepGate && this.doneResolve && (ev.type === 'turn/end' || (ev.type === 'step/end' && this.acc.trim().length > 0 && this.toolCalls.length === 0))) {
+        const r = this.doneResolve; this.doneResolve = null; r('idle')
       }
     }
   }
@@ -211,16 +391,18 @@ class SdkSession {
   steer(text) {
     return this.request('session/prompt', { sessionId: this.sessionId, contentBlocks: [{ type: 'text', text }] }, 15000).catch(() => {})
   }
-  // run one turn with three-tier timer.
+  // run one turn with stream-aware stall watchdog + three-tier timer.
   runTurn(text, timeoutMs = TURN_TIMEOUT, hooks = {}) {
-    const { warnMs, forceMs, onWarn, onForce } = hooks
+    const { warnMs, forceMs, stallTimeoutMs, singleStepGate, onWarn, onForce } = hooks
     const run = async () => {
       if (this.dead) throw new Error('session dead: ' + this.err.slice(-600))
       this.acc = ''; this.toolCalls = []; this.sawRunning = false
+      this.singleStepGate = !!singleStepGate
       this.turnUsage = zeroUsage(); this._lastStepUsageKey = null
       const t0 = Date.now()
+      this.lastActivityAt = t0
       const done = new Promise((res) => { this.doneResolve = res })
-      let warnTimer = null, forceTimer = null
+      let warnTimer = null, forceTimer = null, stallInterval = null, hardTimer = null
       const mins = (ms) => Math.round(ms / 60000 * 10) / 10
       if (warnMs && warnMs > 0 && warnMs < timeoutMs) {
         warnTimer = setTimeout(() => {
@@ -234,12 +416,32 @@ class SdkSession {
           this.steer(`【系统强制收尾】你已运行约 ${mins(forceMs)} 分钟，必须在本次回复内立刻给出最终结果：立即停止一切新的工具调用与探索，基于已获得的信息输出结论、改动摘要与验证情况；若确实未完成，明确列出已完成部分与遗留点。这是最后一次机会，随后将强制终止。`)
         }, forceMs)
       }
-      await this.request('session/prompt', { sessionId: this.sessionId, contentBlocks: [{ type: 'text', text }] }, timeoutMs)
-      let hardTimer
-      const timeoutP = new Promise((_, rej) => { hardTimer = setTimeout(() => { const e = new Error('turn timeout after ' + timeoutMs + 'ms'); e.timedOut = true; rej(e) }, timeoutMs) })
+      await this.request('session/prompt', { sessionId: this.sessionId, contentBlocks: [{ type: 'text', text }] }, Math.min(timeoutMs, 30000))
+      this.lastActivityAt = Date.now()
+      const timeoutP = new Promise((_, rej) => {
+        hardTimer = setTimeout(() => {
+          const e = new Error('turn timeout after ' + timeoutMs + 'ms')
+          e.timedOut = true; rej(e)
+        }, timeoutMs)
+        if (stallTimeoutMs && stallTimeoutMs > 0 && stallTimeoutMs < timeoutMs) {
+          stallInterval = setInterval(() => {
+            const idle = Date.now() - this.lastActivityAt
+            if (idle >= stallTimeoutMs) {
+              const e = new Error(`stall timeout after ${idle}ms without progress (limit ${stallTimeoutMs}ms)`)
+              e.timedOut = true; e.stalled = true; rej(e)
+            }
+          }, 1500)
+        }
+      })
       let status
       try { status = await Promise.race([done, timeoutP]) }
-      finally { clearTimeout(hardTimer); if (warnTimer) clearTimeout(warnTimer); if (forceTimer) clearTimeout(forceTimer) }
+      finally {
+        this.singleStepGate = false
+        clearTimeout(hardTimer)
+        if (stallInterval) clearInterval(stallInterval)
+        if (warnTimer) clearTimeout(warnTimer)
+        if (forceTimer) clearTimeout(forceTimer)
+      }
       return {
         answer: this.acc.trim(),
         toolCalls: this.toolCalls.slice(0, 50),
@@ -266,7 +468,7 @@ class SdkSession {
 }
 
 const pool = new Map()
-function poolKey(sessionKey, tier, workdir) { return `${sessionKey}||${tier}||${normalizeCwdKey(workdir)}` }
+function poolKey(sessionKey, tier, workdir, toolsGroup = 'pure') { return `${sessionKey}||${tier}||${toolsGroup}||${normalizeCwdKey(workdir)}` }
 function evictLRU() {
   while (pool.size > POOL_MAX) {
     let oldestKey = null, oldest = Infinity
@@ -280,44 +482,98 @@ function killAll() { for (const v of pool.values()) v.sess.kill(); pool.clear() 
 process.on('exit', killAll)
 for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { killAll(); process.exit(0) })
 
-async function delegate({ task, cwd, context, sessionKey, tier, fresh, pureText, reasoningEffort, timeoutMs, warnMs, forceMs, onWarn, onForce }) {
+function buildModeFooter(modeName, isReused) {
+  if (modeName === 'fast') {
+    return isReused
+      ? `【精修/极速模式 (fast · KV缓存复用)】直接基于上轮上下文按要求精准修改或补充，严禁废话与多余重构，输出最终结果后立刻结束本轮回复。`
+      : `【极速纯输出模式 (fast)】直接输出简洁、干净、可直接使用的最终代码或结果（建议控制在 150~250 行以内），零寒暄零冗余，输出完成后立刻结束回复。`
+  }
+  if (modeName === 'craft') {
+    return isReused
+      ? `【精工迭代模式 (craft · Pass-2 定点精修)】基于上轮已有成果，精准修复指出的每一处缺陷并拉升完成度，严格保持接口契约不变；保持思考简明扼要，直接输出完整升级后的最终代码后立刻结束本轮回复。`
+      : `【精工纯输出模式 (craft · 速度×质量甜品档)】保持内部思考简明果断（避免反复纠结），把输出预算集中在真实的代码质量与细节密度上：严守给定接口契约，优先采用高完成度实现（如复杂绘制使用离屏缓存、完整边界处理与地道风格），一次性输出完整可运行的成品代码后立刻结束本轮回复，零废话。`
+  }
+  return `【自治代理模式 (agent)】聚焦给定任务边界执行检查、改动与验证；完成后用简洁中文说明你实际改了什么、如何验证的、有无遗留问题。`
+}
+
+async function pickFallbackModel(tierName, excludeModels) {
+  const candidates = tierName === 'max' ? MAGPIE_MAX_ROUTES : MAGPIE_DIRECT_ROUTES
+  const report = await inspectMagpieRoutes(candidates)
+  const primary = report.eligible.filter((r) => r.dshPrimary !== false && !excludeModels.has(r.model))
+  if (primary.length) return primary[0].model
+  const any = report.eligible.filter((r) => !excludeModels.has(r.model))
+  return any.length ? any[0].model : null
+}
+
+async function delegateOnce({ task, cwd, context, sessionKey, tier, mode, model: explicitModel, fresh, pureText, reasoningEffort, timeoutMs, warnMs, forceMs, stallTimeoutMs, onWarn, onForce }) {
   const tierName = TIERS[tier] ? tier : 'flash'
-  const model = TIERS[tierName].model
-  const effort = VALID_EFFORTS.has(reasoningEffort) ? reasoningEffort : 'high'
+  const modeName = resolveMode(mode, pureText, reasoningEffort)
+  const preset = MODE_PRESETS[modeName]
+  const effort = VALID_EFFORTS.has(reasoningEffort) ? reasoningEffort : preset.defaultEffort
   const workdir = resolveWorkdir(cwd)
-  const tmo = clampTmo(timeoutMs)
-  const warn = clampWarn(tmo, warnMs)
-  const force = clampForce(tmo, warn, forceMs)
-  const hooks = { warnMs: warn, forceMs: force, onWarn, onForce }
-  const footer = pureText
-    ? `【纯文本/纯代码快速模式】本次任务严禁调用任何本地工具（禁止执行 pwsh/bash/read/write/edit/glob 等任何命令），不要读取或搜索磁盘文件，请直接输出最终结果或完整代码！`
-    : `【完成后】用简洁中文说明你实际做了什么；若执行了命令/改了文件，说明改了什么、如何验证的、有无遗留问题。`
+  const tmo = clampTmo(timeoutMs ?? preset.defaultTimeoutMs)
+  const warn = preset.tools ? clampWarn(tmo, warnMs) : 0
+  const force = preset.tools ? clampForce(tmo, warn, forceMs) : 0
+  const stallMs = Number.isFinite(stallTimeoutMs) && stallTimeoutMs >= 5000 ? Math.min(tmo, Math.floor(stallTimeoutMs)) : Math.min(tmo, preset.defaultStallMs)
+  const hooks = { warnMs: warn, forceMs: force, stallTimeoutMs: stallMs, singleStepGate: preset.singleStepGate, onWarn, onForce }
+  const toolsGroup = preset.tools ? 'agent' : 'pure'
+
+  // Reuse existing session's pinned direct route when continuing a multi-wave / Pass-2 sessionKey (for KV cache hit),
+  // unless fresh=true or explicitModel differs. Otherwise pick a healthy direct Magpie route!
+  const existingKey = sessionKey ? poolKey(sessionKey, tierName, workdir, toolsGroup) : null
+  const existingRec = existingKey && !fresh ? pool.get(existingKey) : null
+  let model = explicitModel && String(explicitModel).trim() ? String(explicitModel).trim() : null
+  if (!model && existingRec && existingRec.turns < MAX_TURNS && !existingRec.sess.dead) {
+    model = existingRec.sess.model
+  }
+  if (!model) {
+    const plan = await planDirectRoutes(1, tierName)
+    model = plan.models[0] || TIERS[tierName].model
+  }
+
+  const willReuse = !!(existingRec && !fresh && existingRec.turns < MAX_TURNS && !existingRec.sess.dead && (!explicitModel || existingRec.sess.model === model))
+  const footer = buildModeFooter(modeName, willReuse)
   const text = [
     context ? `【上下文 / 来自上游大脑，供参考】\n${context}\n` : '',
     `【任务】\n${task}\n`,
     footer,
   ].filter(Boolean).join('\n')
-  const base = { tier: tierName, model, reasoningEffort: effort, cwd: workdir, pureText: !!pureText, warnMs: warn, forceWrapMs: force, timeoutMs: tmo }
+  const base = {
+    tier: tierName,
+    mode: modeName,
+    model,
+    reasoningEffort: effort,
+    cwd: workdir,
+    tools: preset.tools,
+    isolated: ISOLATE_WORKER,
+    pureText: !preset.tools,
+    stallTimeoutMs: stallMs,
+    warnMs: warn,
+    forceWrapMs: force,
+    timeoutMs: tmo,
+  }
 
   if (!sessionKey) {
-    const s = new SdkSession({ cwd: workdir, model, reasoningEffort: effort })
+    const s = new SdkSession({ cwd: workdir, model, reasoningEffort: effort, tools: preset.tools })
     try {
       await s.start()
       const r = await s.runTurn(text, tmo, hooks)
       return { ok: r.status !== 'error', key: null, sessionId: s.sessionId, reused: false, ...base, status: r.status, elapsedMs: r.elapsedMs, usage: r.usage, answer: r.answer, toolCalls: r.toolCalls }
     } catch (e) {
-      return { ok: false, timedOut: !!e.timedOut, key: null, sessionId: s.sessionId, reused: false, ...base, error: String(e) }
+      return { ok: false, timedOut: !!e.timedOut, stalled: !!e.stalled, key: null, sessionId: s.sessionId, reused: false, ...base, error: String(e) }
     } finally { s.kill() }
   }
 
-  const key = poolKey(sessionKey, tierName, workdir)
+  const key = existingKey
   let rec = pool.get(key); let reused = false
-  if (rec && (fresh || rec.turns >= MAX_TURNS)) { log('recycle', key); rec.sess.kill(); pool.delete(key); rec = null }
+  if (rec && (fresh || rec.turns >= MAX_TURNS || rec.sess.dead || (explicitModel && rec.sess.model !== model))) {
+    log('recycle', key, 'oldModel=', rec.sess.model, 'newModel=', model)
+    rec.sess.kill(); pool.delete(key); rec = null
+  }
   if (!rec) {
-    const s = new SdkSession({ cwd: workdir, model, reasoningEffort: effort })
+    const s = new SdkSession({ cwd: workdir, model, reasoningEffort: effort, tools: preset.tools })
     // Register `rec` with `busy: true` and `initPromise` synchronously BEFORE awaiting `s.start()`!
-    // This prevents both self-eviction in `evictLRU()` and duplicate process creation on concurrent same-key calls.
-    rec = { sess: s, turns: 0, lastUsed: Date.now(), tier: tierName, cwd: workdir, busy: true, initPromise: null }
+    rec = { sess: s, turns: 0, lastUsed: Date.now(), tier: tierName, mode: modeName, tools: preset.tools, cwd: workdir, busy: true, initPromise: null }
     pool.set(key, rec)
     evictLRU()
     rec.initPromise = s.start()
@@ -326,7 +582,7 @@ async function delegate({ task, cwd, context, sessionKey, tier, fresh, pureText,
     } catch (e) {
       rec.sess.kill()
       pool.delete(key)
-      return { ok: false, timedOut: false, key: sessionKey, reused: false, ...base, error: String(e) }
+      return { ok: false, timedOut: false, stalled: false, key: sessionKey, reused: false, ...base, error: String(e) }
     } finally {
       rec.initPromise = null
     }
@@ -336,7 +592,7 @@ async function delegate({ task, cwd, context, sessionKey, tier, fresh, pureText,
     rec.lastUsed = Date.now()
     if (rec.initPromise) {
       try { await rec.initPromise } catch (e) {
-        return { ok: false, timedOut: false, key: sessionKey, reused: true, ...base, error: String(e) }
+        return { ok: false, timedOut: false, stalled: false, key: sessionKey, reused: true, ...base, error: String(e) }
       }
     }
   }
@@ -361,12 +617,27 @@ async function delegate({ task, cwd, context, sessionKey, tier, fresh, pureText,
     }
   } catch (e) {
     try { rec.sess.kill() } catch {}; pool.delete(key)
-    return { ok: false, timedOut: !!e.timedOut, key: sessionKey, sessionId: rec.sess.sessionId, reused, ...base, error: String(e) }
+    return { ok: false, timedOut: !!e.timedOut, stalled: !!e.stalled, key: sessionKey, sessionId: rec.sess.sessionId, reused, ...base, error: String(e) }
   } finally {
     rec.busy = false
     rec.lastUsed = Date.now()
     evictLRU()
   }
+}
+
+async function delegate(opts) {
+  const autoFailover = opts.autoFailover !== false
+  const res = await delegateOnce(opts)
+  if (res.ok || !autoFailover || opts._noRetry) return res
+  // Only auto-failover when route stalled/timed out/crashed and caller did NOT explicitly pin a model
+  const retriable = res.stalled || res.timedOut || /sdk child closed|rpc timeout|session dead/i.test(String(res.error || ''))
+  if (!retriable || opts._pinnedByCaller) return res
+  const tierName = TIERS[opts.tier] ? opts.tier : 'flash'
+  const fallbackModel = await pickFallbackModel(tierName, new Set([res.model]))
+  if (!fallbackModel) return res
+  log('auto-failover triggered:', res.model, '->', fallbackModel, 'reason=', res.error)
+  const retry = await delegateOnce({ ...opts, model: fallbackModel, fresh: true, _noRetry: true })
+  return { ...retry, failoverFrom: { model: res.model, error: res.error, stalled: !!res.stalled } }
 }
 
 // Run `fn` over items with a concurrency limit; preserves result order.
@@ -379,67 +650,101 @@ async function runWithLimit(items, limit, fn) {
   return results
 }
 
-const server = new McpServer({ name: 'dsh-deepseek-worker', version: '2.5.0' })
+const server = new McpServer({ name: 'dsh-deepseek-worker', version: SERVER_VERSION })
 
 server.tool('echo', '连通性自检：回显输入文本。', { text: z.string().describe('要回显的文本') },
   async ({ text }) => ({ content: [{ type: 'text', text: `收到: ${text} @ ${new Date().toISOString()}` }] }))
 
-server.tool('worker_info', '返回 worker 配置、难度档、三级计时与会话池状态（排障用）。', {}, async () => ({
-  content: [{ type: 'text', text: JSON.stringify({
-    version: '2.5.0',
-    profile: PROFILE, defaultWorkspace: DEFAULT_WORKSPACE,
-    defaultWarnMs: WARN_TIMEOUT, defaultForceWrapMs: FORCE_TIMEOUT, defaultTimeoutMs: TURN_TIMEOUT,
-    minTurnTimeoutMs: MIN_TURN_TIMEOUT, maxTurnTimeoutMs: MAX_TURN_TIMEOUT,
-    poolMax: POOL_MAX, parallelMax: PARALLEL_MAX, poolTtlMs: POOL_TTL, maxTurns: MAX_TURNS,
-    tiers: Object.fromEntries(Object.entries(TIERS).map(([k, v]) => [k, { model: v.model, desc: v.desc }])),
-    pool: [...pool.entries()].map(([k, v]) => ({
-      key: k,
-      sessionId: v.sess.sessionId,
-      turns: v.turns,
-      busy: !!v.busy,
-      idleMs: Date.now() - v.lastUsed,
-      sessionUsage: enrichUsageWithCost(v.sess.totalUsage),
-    })),
-  }, null, 2) }],
-}))
+server.tool('worker_info', '返回 worker 配置、三档 mode、隔离补丁状态、Magpie 路线积分与会话池状态（排障用）。', {}, async () => {
+  const routeReport = await inspectMagpieRoutes(MAGPIE_DIRECT_ROUTES, true)
+  return {
+    content: [{ type: 'text', text: JSON.stringify({
+      version: SERVER_VERSION,
+      profile: PROFILE,
+      workerIsolation: {
+        enabled: ISOLATE_WORKER,
+        cleanPatchExists: existsSync(CLEAN_PATCH),
+        purePatchExists: existsSync(PURE_PATCH),
+      },
+      modes: MODE_PRESETS,
+      defaultWorkspace: DEFAULT_WORKSPACE,
+      defaultWarnMs: WARN_TIMEOUT, defaultForceWrapMs: FORCE_TIMEOUT, defaultTimeoutMs: TURN_TIMEOUT,
+      minTurnTimeoutMs: MIN_TURN_TIMEOUT, maxTurnTimeoutMs: MAX_TURN_TIMEOUT,
+      poolMax: POOL_MAX, parallelMax: PARALLEL_MAX, poolTtlMs: POOL_TTL, maxTurns: MAX_TURNS,
+      tiers: Object.fromEntries(Object.entries(TIERS).map(([k, v]) => [k, { model: v.model, desc: v.desc }])),
+      magpieRoutes: routeReport.evaluated.map((r) => ({
+        provider: r.provider,
+        model: r.model,
+        eligible: r.eligible,
+        healthyAccounts: r.healthyAccounts,
+        skipReason: r.skipReason,
+        accounts: r.accounts,
+      })),
+      quotaError: routeReport.quotaError,
+      pool: [...pool.entries()].map(([k, v]) => ({
+        key: k,
+        mode: v.mode,
+        tools: v.tools,
+        model: v.sess.model,
+        sessionId: v.sess.sessionId,
+        turns: v.turns,
+        busy: !!v.busy,
+        idleMs: Date.now() - v.lastUsed,
+        sessionUsage: enrichUsageWithCost(v.sess.totalUsage),
+      })),
+    }, null, 2) }],
+  }
+})
 
 server.tool(
   'delegate_task',
-  '【仅限单一原子级叶子任务！严禁整包甩锅】把不可再拆的单个原子子任务交给 DeepSeek worker（同步返回，附带实时 Token 消耗与人民币费用估算）。警告：若用户任务预计产出 >120 行代码或包含 ≥2 个独立模块/组件/场景/文件，绝对禁止将整个任务原样塞进单次 delegate_task，必须先由你（大脑）设计接口契约并拆成 2~4 个互不重叠的子任务改调 delegate_parallel 并发外包！纯文本/代码片段生成可传 pureText:true 禁用本地工具自检以大幅提速。',
+  '【单一原子任务 / Pass-2 定点精修】将单个叶子任务或针对已有 sessionKey 的 KV 缓存定点精修交给 DeepSeek worker。推荐使用三档 mode：`fast`（极速纯输出/Pass-2 快速精修，10~25s）、`craft`（速度×质量甜品档：禁工具防死循环 + 深度思考 + 高完整度代码，40~90s）、`agent`（开启 shell/fs 工具用于真实排障测试，但仍物理隔离个人 AGENTS.md）。内置失速看门狗与自动故障转移。',
   {
     task: z.string().describe('要 DeepSeek worker 执行的自然语言任务（越具体越好）'),
     cwd: z.string().optional().describe('工作目录（绝对路径）；默认自动回退到工作区目录（Windows 路径大小写/斜杠自动归一化）'),
     context: z.string().optional().describe('可选：来自大脑的记忆/上下文，注入给 worker 参考'),
-    sessionKey: z.string().optional().describe('会话键：相同 key 复用同一常驻会话；省略=一次性全新会话'),
+    sessionKey: z.string().optional().describe('会话键：相同 key 复用同一常驻会话与 KV 缓存（fast 与 craft 共享纯输出池，可直接 Pass-1 craft -> Pass-2 fast 精修）'),
+    mode: z.enum(['fast', 'craft', 'agent']).optional().describe('执行档位：fast=极速纯输出；craft=精工纯输出甜品档（高思考+禁工具）；agent=带工具自治代理。省略时按 pureText 兼容推导'),
     tier: z.enum(['flash', 'max']).optional().describe('难度档：flash=便宜快(默认)；max=更强/1M上下文'),
-    pureText: z.boolean().optional().describe('为 true 时开启纯文本/纯代码快速模式（禁止 worker 调用本地 shell/文件工具，直接生成结果，防过度自检耗时）'),
-    reasoningEffort: z.enum(['low', 'high', 'max']).optional().describe('思考深度：low=极速浅思考；high=深度思考(默认)；max=极限思考'),
+    model: z.string().optional().describe('可选：显式指定 Magpie 独立路线模型 ID（省略则自动按积分挑选健康独立路线）'),
+    pureText: z.boolean().optional().describe('兼容旧参数：为 true 且未指定 mode 时自动映射到 fast（low 思考）或 craft（high 思考）'),
+    reasoningEffort: z.enum(['low', 'high', 'max']).optional().describe('思考深度：省略则按 mode 默认（fast=low, craft/agent=high）'),
+    stallTimeoutMs: z.number().optional().describe('单步失速看门狗超时（毫秒），超时无进展即判失速并触发自动故障转移'),
+    autoFailover: z.boolean().optional().describe('默认 true：遇失速/超时/子进程崩时自动切到另一条健康 Magpie 路线重试一次（显式传 model 时不覆盖）'),
     fresh: z.boolean().optional().describe('为 true 时强制重开会话（清空记忆）'),
-    warnMs: z.number().optional().describe('提醒阈值（毫秒），默认 900000=15 分钟'),
-    forceMs: z.number().optional().describe('强制收尾阈值（毫秒），默认 1500000=25 分钟'),
-    timeoutMs: z.number().optional().describe('硬超时（毫秒），默认 1800000=30 分钟；范围 10s~2h'),
+    warnMs: z.number().optional().describe('agent 模式提醒阈值（毫秒），默认 900000=15 分钟'),
+    forceMs: z.number().optional().describe('agent 模式强制收尾阈值（毫秒），默认 1500000=25 分钟'),
+    timeoutMs: z.number().optional().describe('硬超时（毫秒）；省略则按 mode 默认（fast=120s, craft=300s, agent=1800s）'),
   },
-  async ({ task, cwd, context, sessionKey, tier, pureText, reasoningEffort, fresh, warnMs, forceMs, timeoutMs }, extra) => {
+  async ({ task, cwd, context, sessionKey, mode, tier, model, pureText, reasoningEffort, stallTimeoutMs, autoFailover, fresh, warnMs, forceMs, timeoutMs }, extra) => {
     const notify = (msg) => { try { extra?.sendNotification?.({ method: 'notifications/progress', params: { progressToken: extra?._meta?.progressToken, progress: 1, total: 1, message: msg } }) } catch {} }
-    const onWarn = () => { log('WARN 15m threshold: steering worker to converge'); notify('⚠ DeepSeek worker 已运行约 15 分钟，正在提醒其收敛收尾（25 分钟将强制收尾，30 分钟强制结束）。') }
-    const onForce = () => { log('FORCE 25m threshold: commanding worker to output final result'); notify('⏰ DeepSeek worker 已运行约 25 分钟，已下达强制收尾命令（30 分钟将强制结束）。') }
-    const payload = await delegate({ task, cwd, context, sessionKey, tier, pureText, reasoningEffort, fresh, warnMs, forceMs, timeoutMs, onWarn, onForce })
+    const onWarn = () => { log('WARN threshold: steering worker to converge'); notify('⚠ DeepSeek worker 接近单轮上限，正在提醒收敛收尾。') }
+    const onForce = () => { log('FORCE threshold: commanding worker to output final result'); notify('⏰ DeepSeek worker 触发强制收尾命令。') }
+    const payload = await delegate({
+      task, cwd, context, sessionKey, mode, tier, model,
+      _pinnedByCaller: !!(model && String(model).trim()),
+      pureText, reasoningEffort, stallTimeoutMs, autoFailover, fresh, warnMs, forceMs, timeoutMs, onWarn, onForce,
+    })
     return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] }
   },
 )
 
 server.tool(
   'delegate_parallel',
-  '【中大型/多模块任务首选｜严禁单次过载】将大脑拆解出的 2~4 条独立叶子子任务一次性并发外包给多个 DeepSeek worker（服务端真并行 + 统一返回全文及汇总 Token 账单）。⚠️ 超大型任务（>4 个单元/地图/场景/模块）严禁把多个单元打包塞给同一个 worker，也严禁在单次 delegate_parallel 中塞入超过 4 个重任务导致集体超时！每个子任务单轮最多只允许生成 1~2 个场景/模块（≤350 行代码），当总单元数 N > 4（例如 20 个地图）时，必须拆成多次（Multi-Wave）delegate_parallel 分波次滚动调用（每波 4 个并发任务，跨波次复用 worker-1~worker-4 的 sessionKey 以命中 98% KV 缓存）！同一波次内要并行执行的子任务必须传不同的 sessionKey；纯代码/SVG 片段生成建议设 pureText:true。',
+  '【中大型/多模块任务首选｜三档 mode + 多波次 + 失速故障转移】将大脑拆解出的 2~4 条独立叶子子任务并发外包给多个隔离型 DeepSeek worker（分散到不同健康 Magpie 独立路线 + 自动过滤低积分路线 + 统一返回全文与 KV 缓存命中率账单）。推荐常规复杂开发/视觉渲染使用 `mode: "craft"`（Pass-1 精工首稿，单轮每工人 1~2 单元）→ 大脑快验 → 对薄弱项复用同一 `sessionKey` 发 `mode: "fast"` 或 `"craft"` Pass-2 15 秒定点精修！',
   {
     tasks: z.array(z.object({
       task: z.string().describe('该子任务内容'),
       cwd: z.string().optional(),
       context: z.string().optional(),
       sessionKey: z.string().optional(),
+      mode: z.enum(['fast', 'craft', 'agent']).optional().describe('执行档位：fast | craft(推荐精工甜品档) | agent'),
       tier: z.enum(['flash', 'max']).optional(),
+      model: z.string().optional().describe('可选：显式指定 Magpie 独立路线（省略则自动分配不同健康独立路线）'),
       pureText: z.boolean().optional(),
       reasoningEffort: z.enum(['low', 'high', 'max']).optional(),
+      stallTimeoutMs: z.number().optional(),
+      autoFailover: z.boolean().optional(),
       fresh: z.boolean().optional(),
       warnMs: z.number().optional(),
       forceMs: z.number().optional(),
@@ -451,14 +756,43 @@ server.tool(
     const limit = Math.max(1, Math.min(maxConcurrency || PARALLEL_MAX, 16))
     const t0 = Date.now()
     let done = 0
-    const results = await runWithLimit(tasks, limit, async (t, idx) => {
+
+    // Pre-plan distinct Magpie direct routes (checking live remaining credits and skipping low-credit routes!)
+    const flashPlan = await planDirectRoutes(tasks.length, 'flash')
+    const maxPlan = tasks.some((t) => t.tier === 'max') ? await planDirectRoutes(tasks.length, 'max') : null
+    const eligibleSet = new Set([
+      ...flashPlan.report.eligible.map((r) => r.model),
+      ...(maxPlan ? maxPlan.report.eligible.map((r) => r.model) : []),
+    ])
+
+    const plannedTasks = tasks.map((t, idx) => {
+      const pinnedByCaller = !!(t.model && String(t.model).trim())
+      if (pinnedByCaller) return { ...t, _pinnedByCaller: true }
+      const tierName = TIERS[t.tier] ? t.tier : 'flash'
+      const modeName = resolveMode(t.mode, t.pureText, t.reasoningEffort)
+      const toolsGroup = MODE_PRESETS[modeName].tools ? 'agent' : 'pure'
+      const workdir = resolveWorkdir(t.cwd)
+      // If reusing a warm sessionKey across waves or Pass-2 polish AND its pinned route still has healthy credits, keep it for KV cache!
+      if (t.sessionKey && !t.fresh) {
+        const rec = pool.get(poolKey(t.sessionKey, tierName, workdir, toolsGroup))
+        if (rec && !rec.sess.dead && rec.turns < MAX_TURNS && eligibleSet.has(rec.sess.model)) {
+          return { ...t, model: rec.sess.model, _pinnedByCaller: false }
+        }
+      }
+      const plan = tierName === 'max' && maxPlan ? maxPlan : flashPlan
+      return { ...t, model: plan.models[idx], _pinnedByCaller: false }
+    })
+
+    log('delegate_parallel routePlan:', JSON.stringify(plannedTasks.map((t, i) => ({ idx: i, key: t.sessionKey || null, mode: resolveMode(t.mode, t.pureText, t.reasoningEffort), model: t.model }))))
+
+    const results = await runWithLimit(plannedTasks, limit, async (t, idx) => {
       try {
         const r = await delegate({ ...t })
         done++
-        try { extra?.sendNotification?.({ method: 'notifications/progress', params: { progressToken: extra?._meta?.progressToken, progress: done, total: tasks.length, message: `并行外包 ${done}/${tasks.length} 完成` } }) } catch {}
+        try { extra?.sendNotification?.({ method: 'notifications/progress', params: { progressToken: extra?._meta?.progressToken, progress: done, total: tasks.length, message: `并行外包 ${done}/${tasks.length} 完成 (${r.model || t.model})` } }) } catch {}
         return { index: idx, ...r }
       } catch (e) {
-        return { index: idx, ok: false, error: String(e) }
+        return { index: idx, ok: false, model: t.model, error: String(e) }
       }
     })
     const batchUsage = zeroUsage()
@@ -468,8 +802,11 @@ server.tool(
       ok: results.filter((r) => r.ok).length,
       failed: results.filter((r) => r && !r.ok && !r.timedOut).length,
       timedOut: results.filter((r) => r && r.timedOut).length,
+      failovers: results.filter((r) => r && r.failoverFrom).length,
       maxConcurrency: limit,
       elapsedMs: Date.now() - t0,
+      routePlan: plannedTasks.map((t, i) => ({ index: i, sessionKey: t.sessionKey || null, mode: resolveMode(t.mode, t.pureText, t.reasoningEffort), model: t.model })),
+      skippedRoutes: flashPlan.report.evaluated.filter((r) => !r.eligible).map((r) => ({ provider: r.provider, model: r.model, skipReason: r.skipReason })),
       batchUsage: enrichUsageWithCost(batchUsage),
       results,
     }
@@ -477,9 +814,12 @@ server.tool(
   },
 )
 
-server.tool('pool_status', '查看会话池（哪些 key 常驻、多少轮、空闲多久、累计消耗多少 Token 与费用）。', {}, async () => ({
+server.tool('pool_status', '查看会话池（哪些 key 常驻、mode、路线、多少轮、空闲多久、累计消耗与 KV 缓存命中率）。', {}, async () => ({
   content: [{ type: 'text', text: JSON.stringify([...pool.entries()].map(([k, v]) => ({
     key: k,
+    mode: v.mode,
+    tools: v.tools,
+    model: v.sess.model,
     sessionId: v.sess.sessionId,
     turns: v.turns,
     busy: !!v.busy,
@@ -532,5 +872,5 @@ if (process.argv.includes('--selftest')) {
   } catch (e) { console.error('LADDER_TEST ERROR', e); s.kill(); process.exit(1) }
 } else {
   await server.connect(new StdioServerTransport())
-  log('stdio MCP server ready v2.5.0; profile=', PROFILE, 'poolMax=', POOL_MAX, 'parallelMax=', PARALLEL_MAX, 'warn=', WARN_TIMEOUT, 'force=', FORCE_TIMEOUT, 'timeout=', TURN_TIMEOUT)
+  log(`stdio MCP server ready v${SERVER_VERSION} (3-tier mode + worker isolation + stall failover); profile=`, PROFILE, 'isolated=', ISOLATE_WORKER, 'poolMax=', POOL_MAX, 'parallelMax=', PARALLEL_MAX)
 }

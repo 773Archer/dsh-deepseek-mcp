@@ -1,38 +1,36 @@
-# dsh-deepseek-mcp (v2.5.0)
+# dsh-deepseek-mcp (v3.0.0)
 
 <p align="center">
   <a href="./README.md">English</a> | <strong>简体中文</strong>
 </p>
 
-> **大脑（Google Antigravity / 旗舰大模型）× 手脚（DeepSeek 常驻会话外包工人池）**  
-> 一款生产级 **Stdio MCP 服务端**，将 **DeepSeek Harness (`dsh --profile sdk`)** 封装为具备**常驻热会话记忆、服务端多路并发扇出、三级防跑飞计时器、98%+ KV 缓存复用与实时流式 Token/人民币账单核算**的外部 Worker 池，专为 **Google Antigravity**、Claude Code、Cursor 等 MCP 客户端打造。
+> **大脑（Google Antigravity / 旗舰大模型）× 手脚（物理隔离、积分感知的 DeepSeek 外包工人池）**  
+> 一款生产级 **Stdio MCP 服务端**，将 **DeepSeek Harness (`dsh --profile sdk`)** 封装为具备**三档执行模式（`fast` / `craft` / `agent`）、物理隔离精简 Worker 环境（首轮底座 `9,409 → 161` tokens）、Magpie 积分感知多路直连分流、失速看门狗与自动故障转移、以及 98%+ KV 缓存二段式精修**的外部 Worker 池，专为 **Google Antigravity**、Claude Code、Cursor 等 MCP 客户端打造。
 
-[![Version](https://img.shields.io/badge/version-2.5.0-teal.svg)](https://github.com/773Archer/dsh-deepseek-mcp)
+[![Version](https://img.shields.io/badge/version-3.0.0-teal.svg)](https://github.com/773Archer/dsh-deepseek-mcp)
 [![MCP SDK](https://img.shields.io/badge/MCP_SDK-1.32.2-blue.svg)](https://modelcontextprotocol.io)
 [![Backend](https://img.shields.io/badge/Backend-DSH_SDK_JSON--RPC-purple.svg)](https://github.com/773Archer/dsh-deepseek-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 
 ---
 
-## ✨ 为什么要做 `dsh-deepseek-mcp`？
+## ✨ v3.0.0 核心升级（速度 × 质量甜品点）
 
-在 **Google Antigravity** 等 AI IDE 中，顶层编排大模型（如 Gemini / Claude）极其擅长全局架构拆解、跨模块推理与最终集成验收；但如果把单文件小改、样板/测试生成、几十步的 Shell 工具试错循环全都塞在主对话里，不仅会迅速污染主上下文窗口，还会白白烧掉昂贵的旗舰模型额度。
-
-`dsh-deepseek-mcp` 采用**零反代、零侵入的「大脑 × 外包工人分流架构（Shunt Pattern）」**：
-
-1. **🔥 常驻热会话池（`sessionKey` + 98%+ KV 缓存命中率）**  
-   底层直连 DSH 官方 `dsh --profile sdk` JSON-RPC 服务。同一轮任务拆出的多条子任务只需传入相同的 `sessionKey`，即可复用同一个常驻 DeepSeek 进程与上下文记忆——实测 **KV 缓存命中率超 98%**（空闲时段缓存命中仅需 **¥0.02 元 / 百万 Tokens**！）。切换无关新任务时换新 Key 或省略即可彻底隔离，零串味污染。
-2. **⚡ 真正的服务端并发扇出（`delegate_parallel`）**  
-   单次 MCP 调用即可并发下发最多 16 条独立子任务。不同 `sessionKey` 的子任务在多个 `dsh --profile sdk` 进程间真并行执行；相同 `sessionKey` 的并发请求会自动通过 `initPromise` 初始化锁与 `runTurn` 互斥锁安全排队并共享记忆，彻底杜绝孤儿进程与竞态。
-3. **⏱️ 三级墙钟防跑飞计时器（`15m / 25m / 30m`）**  
-   专治 Agent 陷入无限工具调用死循环或“雷霆大思考”：
-   - **一级温和提醒（`warnMs`，默认 15 分钟）**：通过 JSON-RPC 实时向运行中的 Worker 注入收敛提醒，要求停止发散探索。
-   - **二级强制收尾（`forceMs`，默认 25 分钟）**：下达最后通牒，命令立刻停止一切新工具调用并在当前回复内输出最终结论与进度。
-   - **三级硬超时强杀（`timeoutMs`，默认 30 分钟）**：超时瞬间终止会话并调用 `taskkill /PID <pid> /T /F` 连根拔起 Worker 派生的整棵孙进程树（如 PowerShell、无头浏览器），返回 `timedOut: true`。
-4. **🚀 `pureText` 纯文本/纯代码极速模式 & `reasoningEffort` 思考深度分档**  
-   对于无需读写磁盘或跑命令自检的纯代码/SVG/文案生成任务，传 `pureText: true` 即可严禁 Worker 调用本地工具自嗨，将耗时从 10 分钟以上直接砍到 **30~40 秒**；同时支持按任务难度单次指定 `reasoningEffort`（`low` 极速 | `high` 深度 | `max` 极限）。
-5. **💰 实时流式 Token 计量与官方峰谷人民币账单（`usage` / `batchUsage`）**  
-   在 JSON-RPC 事件流中实时拦截 `assistant/message` 的 Token 消耗块，自动识别北京时间**官方高峰/空闲半价时段（周末全天与工作日夜间 5 折）**，在每次调用返回 JSON 中直接附带 `uncachedInputTokens`、`cacheReadTokens`、`outputTokens`、实付人民币估算 `estimatedCostCNY` 以及本地 Magpie 网关积分。
+1. **🎯 三档执行模式（`mode: "fast" | "craft" | "agent"`）**  
+   彻底将“工具隔离”与“输出完成度”解耦（并向后兼容旧 `pureText` 参数）：
+   - **`fast`（极速纯输出，禁工具 + `low` 思考，失速阈值 `60s`）**：样板配置、短胶水代码以及 **Pass-2 快速定点精修**（`10~25s`）。
+   - **`craft`（精工纯输出甜品档，禁工具 + 隔离上下文 + 高完成度输出，失速阈值 `120s`）**：**复杂代码与视觉创作的默认首选**（`20~60s`），彻底杜绝外包跑去瞎敲 shell 浪费几分钟，同时解除硬性短行数限制、稳产 250~500 行精绘/高内聚代码；遇到极难算法可显式传 `reasoningEffort: "high"`。
+   - **`agent`（带工具自治代理，开启 shell/fs 工具 + 依然物理隔离个人 `AGENTS.md`）**：用于真实代码库排障、跑单测与多文件重构。
+2. **🧼 物理隔离 Worker 环境（`worker-clean.patch.yml` + `worker-pure.patch.yml`）**  
+   启动每个 `dsh --profile sdk` 子进程时自动叠加原生 Cordis `--patch` 补丁：
+   - **全模式隔离**：底层直接禁用 `agent-instructions`（彻底不读不传个人 `~/.dsh/AGENTS.md`）、`skill-filesystem`、`tool-skill`、`plan-mode`、`user-questions` 及子代理/目标循环插件，杜绝个人人设与外包任务指令打架。
+   - **`fast`/`craft` 零工具瘦身**：运行时直接卸载 `pwsh`/`bash`/`fs`/`jobs`/`web` 工具定义，首轮上传底座从 **`~9,409` tokens 暴降至 `161` tokens（`-98.3%`）**、**`tools: []`（0 工具）**、请求头仅 **`152` 字节**，完美兼容对提示词长度或 Function Calling 挑食的各类 Magpie 反代供应商！
+3. **🛡️ 流式失速看门狗 + 单轮收尾闸门 + 1 次自动故障转移**  
+   盯紧 JSON-RPC 有效事件流刷新活跃时间（`stallTimeoutMs`），`fast`/`craft` 模式首步输出完正文即通过 `singleStepGate` 干脆收网防二轮自嗨；某一路失速/超时/子进程崩掉时（且调用方未显式锁死 `model`），自动触发 `autoFailover` 切换至另一条健康 Magpie 路线重试一次并附带 `failoverFrom` 留痕。
+4. **🔁 二段式 KV 缓存精修（Pass-1 `craft` → Pass-2 `fast`，实时回报 `cacheHitRate`）**  
+   `fast` 与 `craft` 共享同一纯输出 `sessionKey` 池桶：先用 `craft` 并发出首稿 → 大脑跑语法/单测/截图质检 → 仅对薄弱模块复用原 `sessionKey` 发 `fast` 定点精修，实测命中 **`95~98.9%` KV 缓存**（空闲时段 ¥0.02/百万 Tokens），15~35 秒拉升至精品！
+5. **🧭 Magpie 实时积分感知 + 多路独立路线分流**  
+   调用 `magpie quota --json`（60s 缓存）自动过滤积分不足的路线，在 `delegate_parallel` 中将各并发通道分散到不同健康直连路线（绕开单一 routing group 拥堵）；跨波次或 Pass-2 复用 `sessionKey` 时自动黏住原健康路线保住 KV 缓存。
 
 ---
 
@@ -43,21 +41,21 @@
   │
   ▼
 Google Antigravity / 顶层编排大模型（"大脑"）
-  ├─ 全局规则 (`delegate-to-dsh.md`)：自动评估任务复杂度
-  │    ├─ 简单 / 叶子级杂活 ───────► `delegate_task(tier: "flash")` 直派
-  │    └─ 复杂系统 / 大工程 ───────► 大脑设计接口契约并拆解叶子模块
-  │                                  ├─► `delegate_parallel(tasks: [...], maxConcurrency: 4)`
-  │                                  └─► 大脑汇总审阅、联调统合与实机验收
+  ├─ 全局插件规则 (`delegate-to-dsh.md` v3.0)：
+  │    ├─ 微型原子杂活 ─────────► `delegate_task(mode: "fast")`
+  │    ├─ 复杂/多波次工程 ──────► Pass-1 `delegate_parallel(mode: "craft", maxConcurrency: 4)`
+  │    │                           ├─► 大脑语法 / 运行 / 截图快验
+  │    │                           └─► Pass-2 复用原 `sessionKey` (`mode: "fast"`, 98% KV 缓存)
+  │    └─ 代码库排障 / 跑测试 ──► `delegate_task(mode: "agent")`
   ▼
-MCP 服务端：`dsh-deepseek-mcp` (Stdio JSON-RPC v2.5.0)
-  ├─ 防自杀竞态 LRU 会话池 (`POOL_MAX=4`, `POOL_TTL=30m`, `MAX_TURNS=40`)
-  ├─ Windows 路径大小写/斜杠归一化 (`D:\agy` === `d:/agy`)
-  ├─ 三级防跑飞计时阶梯 (`warnMs` -> `forceMs` -> `timeoutMs` + 进程树连根清理)
-  └─ 实时流式 Token & 人民币峰谷费用核算器
+MCP 服务端：`dsh-deepseek-mcp` (Stdio JSON-RPC v3.0.0)
+  ├─ 物理隔离补丁层 (`worker-clean.patch.yml` + `worker-pure.patch.yml`)
+  ├─ Magpie 实时积分体检 (`magpie quota --json`) & 多路直连分流器
+  ├─ 防自杀竞态 LRU 会话池 (`POOL_MAX=4`，`fast`/`craft` 共享 `pure` 缓存桶)
+  ├─ 流式失速看门狗 + 单轮收尾闸门 + 1 次自动故障转移 + 进程树连根清理
+  └─ 实时流式 Token、`cacheHitRate` 与北京时间峰谷人民币账单核算器
   ▼
-常驻 `dsh --profile sdk` Worker 进程池
-  ├─ `flash` 档：`auto/deepseek-v4.1-flash`（便宜快，默认主力）
-  └─ `max` 档：  `trae-cn/deepseek-v4.1-flash-max`（1M 超长上下文重装档）
+物理隔离的 `dsh --profile sdk` Worker 进程池（`fast`/`craft` 底座仅 161 Tokens）
 ```
 
 ---
@@ -66,10 +64,10 @@ MCP 服务端：`dsh-deepseek-mcp` (Stdio JSON-RPC v2.5.0)
 
 | 工具名称 | 功能说明 |
 | :--- | :--- |
-| **`delegate_task`** | 外派单个子任务给 DeepSeek Worker。支持 `task`、`cwd`、`context`、`sessionKey`、`tier` (`flash`\|`max`)、`pureText` (`boolean`)、`reasoningEffort` (`low`\|`high`\|`max`)、`fresh`、`warnMs`、`forceMs`、`timeoutMs`。返回完整 `answer`、`toolCalls`、`elapsedMs`、单轮 `usage` 与会话累计 `sessionUsage`。 |
-| **`delegate_parallel`** | 服务端多路并发外包多条子任务（默认并发 4，最高 16）。按序返回每条任务的完整 `answer`（绝不截断）以及整批任务的汇总 Token 与人民币账单 `batchUsage`。 |
-| **`pool_status`** | 查看当前常驻会话池状态（包含 `key`、`sessionId`、已跑轮次 `turns`、`busy` 状态、空闲时长 `idleMs` 及该会话累计消耗的 Token 与人民币费用 `sessionUsage`）。 |
-| **`worker_info`** | 查看服务端版本（`2.5.0`）、档位模型映射、三级计时阈值与当前会话池快照。 |
+| **`delegate_task`** | 外派单一原子任务或针对已有 `sessionKey` 的 Pass-2 定点精修。支持 `task`、`cwd`、`context`、`sessionKey`、`mode` (`fast`\|`craft`\|`agent`)、`tier` (`flash`\|`max`)、`model`、`pureText`（旧参数兼容）、`reasoningEffort`、`stallTimeoutMs`、`autoFailover`、`fresh`、`warnMs`、`forceMs`、`timeoutMs`。返回完整 `answer`、`toolCalls`、`elapsedMs`、单轮 `usage`（含 `cacheHitRate`）、`sessionUsage` 及 `failoverFrom`。 |
+| **`delegate_parallel`** | 服务端多路并发外包 2~4 条（最高 16 条）子任务，自动分散到不同健康 Magpie 直连路线并跳过低积分路线。按序返回完整 `results`、`routePlan`、`skippedRoutes`、`failovers` 与整批汇总账单 `batchUsage`。 |
+| **`pool_status`** | 查看常驻会话池快照（`key`、`mode`、`tools`、`model`、`sessionId`、`turns`、`busy`、`idleMs` 及累计 `sessionUsage`）。 |
+| **`worker_info`** | 查看服务端版本（`3.0.0`）、`workerIsolation` 补丁状态、三档 `modes` 预设、各 `magpieRoutes` 实时积分状态与会话池快照。 |
 | **`reset_session`** | 丢弃指定 `sessionKey`（不传则清空全部）的常驻会话并清理其底层进程树。 |
 | **`echo`** | 连通性秒级自检工具。 |
 
@@ -80,6 +78,7 @@ MCP 服务端：`dsh-deepseek-mcp` (Stdio JSON-RPC v2.5.0)
 ### 1. 环境要求
 - **Node.js** `>= 18`
 - 已安装 **DeepSeek Harness (`@deepseek-ai/dsh`)** 并配置好 `sdk` profile（`~/.dsh/profiles/sdk`）。
+- 可选：**Magpie** 本地网关 CLI（`magpie quota --json`），可在 `server.mjs` 顶部的 `MAGPIE_DIRECT_ROUTES` 自由增删/调整你的独立路线与积分阈值。
 
 ### 2. 克隆与安装依赖
 ```bash
@@ -101,16 +100,15 @@ npm install
         "POOL_MAX": "4",
         "PARALLEL_MAX": "4",
         "DEFAULT_WORKSPACE_CWD": "d:/agy"
-      }
+      },
+      "timeoutSeconds": 7200
     }
   }
 }
 ```
 
-### 4. （必装：激活默认主动外包与强制拆单）安装全局编排插件
+### 4. （必装：激活默认主动外包与 v3.0 编排铁律）安装全局编排插件
 > **⚠️ Antigravity 2.0 避坑重点**：在 Antigravity 2.0 插件化架构下，散装放在 `~/.gemini/config/rules/*.md` 的规则文件会被 Language Server 静默忽略！全局规则**必须**封装在 `~/.gemini/config/plugins/<插件名>/rules/AGENTS.md` 中才会 100% 注入 `<user_rules>`。
-
-使用本仓库附带的 `plugin.json` 与 `delegate-to-dsh.md` 创建 `dsh-deepseek-delegator` 全局插件，即可彻底激活三大铁律：**「新会话无需提醒默认主动外包」**、**「>120 行或 ≥2 模块严禁整包甩锅、强制走 `delegate_parallel` 并发」**，以及**「超大型任务（>4 个单元/地图/场景）严禁单次捆绑过载，必须限制单工人单轮只做 1~2 个单元，并拆成多波次（Multi-Wave）滚动调用 `delegate_parallel(4)` + 跨波次复用 `sessionKey` 吃满 98% KV 缓存」**：
 
 ```bash
 mkdir -p ~/.gemini/config/plugins/dsh-deepseek-delegator/rules
@@ -120,32 +118,28 @@ cp delegate-to-dsh.md ~/.gemini/config/plugins/dsh-deepseek-delegator/rules/AGEN
 
 ---
 
-## 🧪 实战压测战绩：245 KB 单文件四国画中世界 SVG 动画
+## 🧪 v3.0.0 真实压测战绩
 
-在**「鹈鹕在串联拍立得相片内部风景世界里骑自行车环游世界（锁定跟拍运镜 + 相框交界物理裁剪遮挡）」**的实战压测中：
-- 大脑拆解坐标与裁剪契约后，通过 `delegate_parallel` 并发调度 **4 路 DeepSeek Worker**（`svg-pelican-hero`、`svg-photo-1-2`、`svg-photo-3-4`、`svg-frames-studio`）协同手搓了 **244,997 字节（245 KB）** 的零依赖单文件矢量动画。
-- **总 Token 吞吐量**：**6,413,000 Tokens**（未缓存输入 `100,537` + KV 缓存命中 `5,869,824` + 深度思考与代码输出 `442,639`）。
-- **KV 缓存命中率**：**`98.32%`**（其中最重的一路 Worker 自行调用 20+ 步无头 Chrome 渲染截图与裁图自检，454 万缓存读取仅花费 ¥0.09 元！）。
-- **DeepSeek 官方 API 空闲时段实付总成本**：**¥1.99 元人民币**！
+- **反代底座瘦身实测**：
+  - 改造前裸 `dsh --profile sdk`：首轮上传 **`~9,409` tokens**（含个人 `AGENTS.md` + 全部技能 + 20+ 工具 Schema）。
+  - v3.0.0 `fast`/`craft`（物理隔离双补丁）：首轮实测仅 **`161` tokens**、**`tools: []`**、请求头 **`152` 字节**（**直降 98.3%**）！
+- **二段式 KV 缓存精修实测**：
+  - Pass-1（`mode: "craft"`）：隔离首轮未缓存输入仅 `665` tokens；
+  - Pass-2（复用同一 `sessionKey` 切 `mode: "fast"` 定点精修）：**KV 缓存命中率 `98.9%`**（`19,712` 缓存读取 vs 仅 `213` 新输入），实付仅 **¥0.027 元**。
+- **超大型多波次实战压测（20 个艺术史时代 2 分 17 秒纯代码短片）**：
+  - 5 波 × 4 路真并发 **20/20 子任务全绿零超时**，产出 **215 KB** 零素材 Canvas 2D + Web Audio 实时代码，吃满 **561,920 KV 缓存读取 Tokens**，总费用仅 **¥0.95 元人民币**。
 
 ---
 
 ## ✅ 内置自检与端到端测试套件
 
 ```bash
-# 1. 常驻会话记忆复用与实时 Token 计费自检
-npm run selftest
-
-# 2. 墙钟硬超时强杀自检（缩放到 1.2s）
-npm run test:timeout
-
-# 3. 三级计时器阶梯触发自检（3s 提醒 -> 6s 催收尾 -> 25s 硬上限）
-npm run test:ladder
-
-# 4. 完整 MCP Stdio 端到端测试套件
-npm run test:e2e
-npm run test:reuse
-npm run test:parallel
+npm run selftest       # 常驻会话记忆复用与实时 Token 计费自检
+npm run test:timeout   # 墙钟硬超时强杀自检（缩放到 1.2s）
+npm run test:ladder    # 三级计时器阶梯触发自检（3s -> 6s -> 25s）
+npm run test:e2e       # 完整 MCP Stdio 端到端测试
+npm run test:reuse     # sessionKey 记忆复用与隔离测试
+npm run test:parallel  # 服务端多路并发加速比测试
 ```
 
 ---
@@ -157,14 +151,16 @@ npm run test:parallel
 | `DSH_NODE` | `process.execPath` | 拉起 `dsh` 子进程所使用的 Node 可执行文件路径 |
 | `DSH_BIN` | `~/nodejs/node_modules/@deepseek-ai/dsh/lib/bin.js` | `@deepseek-ai/dsh/lib/bin.js` 入口路径 |
 | `DSH_WORKER_PROFILE` | `sdk` | DSH 运行 profile 名称 |
+| `DSH_WORKER_ISOLATE` | `1`（设 `0` 可关闭） | 是否自动挂接 `worker-clean.patch.yml` / `worker-pure.patch.yml` 隔离补丁 |
+| `MAGPIE_QUOTA_TTL_MS` | `60000` (60 秒) | `magpie quota --json` 积分查询缓存时间 |
 | `DEFAULT_WORKSPACE_CWD` | `d:\agy` 或 `process.cwd()` | 当未传 `cwd` 或检测到默认目录落在 IDE 安装目录时的安全回退工作区 |
 | `PARALLEL_MAX` | `4` | `delegate_parallel` 默认并发上限（1–16） |
 | `POOL_MAX` | `max(4, PARALLEL_MAX)` | 常驻会话池最大保留会话数（LRU 淘汰） |
 | `POOL_TTL_MS` | `1800000` (30 分钟) | 空闲会话自动回收时间 |
 | `MAX_TURNS` | `40` | 单个常驻会话最大轮次上限（超限自动重开） |
-| `DELEGATE_WARN_MS` | `900000` (15 分钟) | 一级收敛提醒阈值 |
-| `DELEGATE_FORCE_MS` | `1500000` (25 分钟) | 二级强制收尾命令阈值 |
-| `DELEGATE_TIMEOUT_MS` | `1800000` (30 分钟) | 三级硬超时强杀阈值 |
+| `DELEGATE_WARN_MS` | `900000` (15 分钟) | `agent` 模式一级收敛提醒阈值 |
+| `DELEGATE_FORCE_MS` | `1500000` (25 分钟) | `agent` 模式二级强制收尾命令阈值 |
+| `DELEGATE_TIMEOUT_MS` | `1800000` (30 分钟) | `agent` 模式三级硬超时强杀阈值 |
 
 ---
 

@@ -1,0 +1,39 @@
+# Clean worker isolation patch for dsh-deepseek-mcp (v3.0.0)
+# Strips personal ~/.dsh/AGENTS.md, irrelevant personal skills, and autonomous goal/subagent loops
+# so outsourced workers stay focused, fast, and strictly adherent to the Brain's contract.
+- id: agent-instructions
+  disabled: true
+- id: skill-filesystem
+  disabled: true
+- id: tool-skill
+  disabled: true
+- id: tool-goal
+  disabled: true
+- id: goal-round-driver
+  disabled: true
+- id: command-goal
+  disabled: true
+- id: tool-ralph
+  disabled: true
+- id: tool-todo
+  disabled: true
+- id: tool-subagent
+  disabled: true
+- id: tool-subagent-fork
+  disabled: true
+- id: tool-subagent-control
+  disabled: true
+- id: tool-subagent-list-agents
+  disabled: true
+- id: tool-workflow
+  disabled: true
+- id: plan-mode
+  disabled: true
+- id: user-questions
+  disabled: true
+- id: system-prompt
+  config:
+    personaPrefix: >
+      You are a disciplined specialist engineering worker operating inside a multi-worker pipeline under a Chief Architect (The Brain).
+      Follow the contract, interfaces, and scope given in the prompt with high craftsmanship and zero filler.
+    personaSuffix: Your working directory is {{cwd}}.

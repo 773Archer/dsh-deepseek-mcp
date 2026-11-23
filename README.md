@@ -1,38 +1,36 @@
-# dsh-deepseek-mcp (v2.5.0)
+# dsh-deepseek-mcp (v3.0.0)
 
 <p align="center">
   <strong>English</strong> | <a href="./README.zh-CN.md">简体中文</a>
 </p>
 
-> **Brain (Antigravity / Frontier LLM) × Hands (Persistent DeepSeek Worker Pool)**  
-> A production-grade **Stdio MCP Server** that turns **DeepSeek Harness (`dsh --profile sdk`)** into a warm, stateful, parallelizable worker pool for **Google Antigravity**, Claude Code, Cursor, and any MCP-compatible host.
+> **Brain (Antigravity / Frontier LLM) × Hands (Isolated, Credit-Aware DeepSeek Worker Pool)**  
+> A production-grade **Stdio MCP Server** that turns **DeepSeek Harness (`dsh --profile sdk`)** into a warm, stateful, parallelizable worker pool with **3-tier execution modes (`fast` / `craft` / `agent`)**, **physical prompt/tool isolation (`9,409 → 161` tokens)**, **Magpie credit-aware direct-route spreading**, **stall watchdogs + automatic failover**, and **98%+ KV-cached two-pass polish** for **Google Antigravity**, Claude Code, Cursor, and any MCP-compatible host.
 
-[![Version](https://img.shields.io/badge/version-2.5.0-teal.svg)](https://github.com/773Archer/dsh-deepseek-mcp)
+[![Version](https://img.shields.io/badge/version-3.0.0-teal.svg)](https://github.com/773Archer/dsh-deepseek-mcp)
 [![MCP SDK](https://img.shields.io/badge/MCP_SDK-1.32.2-blue.svg)](https://modelcontextprotocol.io)
 [![Backend](https://img.shields.io/badge/Backend-DSH_SDK_JSON--RPC-purple.svg)](https://github.com/773Archer/dsh-deepseek-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 
 ---
 
-## ✨ Why `dsh-deepseek-mcp`?
+## ✨ What's New in v3.0.0 (Speed × Quality Sweet Spot)
 
-Frontier orchestrator models (like Gemini / Claude inside **Google Antigravity**) excel at system architecture, cross-module reasoning, and final integration—but burning their context window and quota on leaf tasks, boilerplate generation, or 40-step tool loops is slow and expensive.
-
-`dsh-deepseek-mcp` implements the **Brain × Worker Shunt Architecture** without any reverse-proxying or ToS hacks:
-
-1. **🔥 Persistent Warm Session Pool (`sessionKey` + 98%+ KV Cache Hit)**  
-   Backed by DSH's official `dsh --profile sdk` JSON-RPC runtime. Subtasks sharing the same `sessionKey` reuse the exact same warm DeepSeek agent process and memory—achieving **>98% KV Cache hit rates** (¥0.02 / 1M tokens off-peak!). Unrelated tasks use a new key (or omit it) for zero context contamination.
-2. **⚡ True Server-Side Parallel Fan-Out (`delegate_parallel`)**  
-   Dispatch up to 16 independent leaf tasks in a single MCP tool call. Distinct `sessionKey`s execute concurrently across multiple `dsh --profile sdk` workers; identical `sessionKey`s automatically serialize through an `initPromise` + turn mutex lock to share memory safely.
-3. **⏱️ Three-Tier Wall-Clock Anti-Runaway Timer (`15m / 25m / 30m`)**  
-   Tames runaway agent loops with a three-stage ladder:
-   - **Warn (`warnMs`, default 15 min)**: Injects a live steering nudge via JSON-RPC to start converging.
-   - **Force Wrap-Up (`forceMs`, default 25 min)**: Commands the worker to stop all new tool calls immediately and output its final summary.
-   - **Hard Timeout (`timeoutMs`, default 30 min)**: Terminates the worker and its entire Windows/POSIX subprocess tree (`taskkill /T /F`), returning `timedOut: true`.
-4. **🚀 `pureText` Fast Generation Mode & Configurable `reasoningEffort`**  
-   Set `pureText: true` for pure code/SVG/text generation tasks to forbid the worker from running unnecessary local shell/browser self-verification loops—cutting latency from 10+ minutes to ~30 seconds. Supports per-call `reasoningEffort` (`low` | `high` | `max`).
-5. **💰 Real-Time Token & Cost Accounting (`usage` / `batchUsage`)**  
-   Intercepts live `assistant/message` token meter events from the DSH SDK stream and returns exact `uncachedInputTokens`, `cacheReadTokens`, `outputTokens`, automatic Beijing Peak/Off-Peak detection (`isOffPeak`), and real-time RMB cost (`estimatedCostCNY`).
+1. **🎯 Three-Tier Execution Modes (`mode: "fast" | "craft" | "agent"`)**  
+   Decouples tool isolation from output craftsmanship (backward-compatible with legacy `pureText`):
+   - **`fast`** (no tools, `low` effort, `60s` stall cap): Boilerplate, configs, short glue scripts, and **Pass-2 targeted polish** (`10–25s`).
+   - **`craft`** (no tools, stripped context, unrestricted craftsmanship, `120s` stall cap): **The default sweet spot for complex code & generative visuals** (`20–60s`), producing complete 250–500 line modules without tool-loop runaway. Pass `reasoningEffort: "high"` explicitly when deep algorithmic reasoning is needed.
+   - **`agent`** (shell/fs tools enabled, personal `AGENTS.md`/skills still isolated): Real repo debugging, test execution, and multi-file refactoring.
+2. **🧼 Physical Worker Isolation (`worker-clean.patch.yml` + `worker-pure.patch.yml`)**  
+   Injects native DSH Cordis `--patch` overlays on every spawned worker:
+   - Strips personal `~/.dsh/AGENTS.md`, unrelated `<available_skills>`, `plan-mode`, `user-questions`, and autonomous subagent/goal loops in **all** modes.
+   - Unloads `pwsh`/`bash`/`fs`/`jobs`/`web` tool schemas at runtime in `fast`/`craft` modes—cutting base input overhead from **`~9,409` tokens down to `161` tokens (`-98.3%`)** with **`tools: []`** (`152` header bytes) so even strict or low-context reverse-proxy providers never reject bloated prompts!
+3. **🛡️ Stream-Aware Stall Watchdog + Single-Turn Gate + Automatic 1× Failover**  
+   Tracks real JSON-RPC progress timestamps (`stallTimeoutMs`), immediately resolves single-turn `fast`/`craft` completions (`singleStepGate`) to prevent spurious Turn-2 self-chat, and automatically fails over once (`autoFailover: true`) to another healthy direct Magpie route if a lane stalls or crashes.
+4. **🔁 Two-Pass Craft + Cheap KV-Cached Critique/Polish (`cacheHitRate` Telemetry)**  
+   `fast` and `craft` share the same warm `pure` session pool bucket. Run **Pass-1 (`mode: "craft"`)** across 4 workers → run Brain QA → send targeted fixes back to the **same `sessionKey`** (`mode: "fast"`), hitting **`95–98.9%` KV cache** (~¥0.02/M off-peak) in seconds!
+5. **🧭 Magpie Credit-Aware Direct-Route Load Balancing**  
+   Checks live quotas via `magpie quota --json` (60s cache), skips low-credit routes automatically, and spreads concurrent lanes in `delegate_parallel` across distinct healthy direct Magpie routes instead of piling onto a single routing group. Multi-wave sessions stay pinned to their warm route for maximum KV cache reuse.
 
 ---
 
@@ -43,21 +41,21 @@ User Request
   │
   ▼
 Google Antigravity / Orchestrator LLM ("The Brain")
-  ├─ Global Rule (`delegate-to-dsh.md`): Triage complexity
-  │    ├─ Simple / Leaf Task ──────► `delegate_task(tier: "flash")`
-  │    └─ Complex Architecture ────► Brain designs contract & decomposes
-  │                                  ├─► `delegate_parallel(tasks: [...], maxConcurrency: 4)`
-  │                                  └─► Brain integrates, verifies & delivers
+  ├─ Global Plugin Rule (`delegate-to-dsh.md` v3.0):
+  │    ├─ Micro leaf task ────────► `delegate_task(mode: "fast")`
+  │    ├─ Complex / Multi-Wave ───► Pass-1 `delegate_parallel(mode: "craft", maxConcurrency: 4)`
+  │    │                            ├─► Brain runs syntax / runtime / visual QA
+  │    │                            └─► Pass-2 `same sessionKey` (`mode: "fast"`, 98% KV cache)
+  │    └─ Repo debug / tests ─────► `delegate_task(mode: "agent")`
   ▼
-MCP Server: `dsh-deepseek-mcp` (Stdio JSON-RPC)
-  ├─ Race-free LRU Session Pool (`POOL_MAX=4`, `POOL_TTL=30m`, `MAX_TURNS=40`)
-  ├─ Windows Path Normalization (`D:\agy` === `d:/agy`)
-  ├─ 3-Tier Timer Ladder (`warnMs` -> `forceMs` -> `timeoutMs` + Process Tree Kill)
-  └─ Real-Time Stream Token & RMB Cost Meter
+MCP Server: `dsh-deepseek-mcp` (Stdio JSON-RPC v3.0.0)
+  ├─ Worker Isolation Patches (`worker-clean.patch.yml` + `worker-pure.patch.yml`)
+  ├─ Magpie Live Quota Checker (`magpie quota --json`) & Direct-Route Spreader
+  ├─ Race-Free LRU Session Pool (`POOL_MAX=4`, shared `pure` bucket for fast/craft)
+  ├─ Stream Stall Watchdog + Single-Turn Gate + Auto 1x Failover + Process Tree Kill
+  └─ Real-Time Token, `cacheHitRate` & Beijing Peak/Off-Peak RMB Cost Meter
   ▼
-Persistent `dsh --profile sdk` Worker Processes
-  ├─ `flash` tier: `auto/deepseek-v4.1-flash`
-  └─ `max` tier:   `trae-cn/deepseek-v4.1-flash-max` (1M Context)
+Isolated `dsh --profile sdk` Worker Processes (161-token base in `fast`/`craft`)
 ```
 
 ---
@@ -66,10 +64,10 @@ Persistent `dsh --profile sdk` Worker Processes
 
 | Tool Name | Description |
 | :--- | :--- |
-| **`delegate_task`** | Delegate a single task to a DeepSeek worker. Supports `task`, `cwd`, `context`, `sessionKey`, `tier` (`flash`\|`max`), `pureText` (`boolean`), `reasoningEffort` (`low`\|`high`\|`max`), `fresh`, `warnMs`, `forceMs`, `timeoutMs`. Returns full `answer`, `toolCalls`, `elapsedMs`, `usage`, and `sessionUsage`. |
-| **`delegate_parallel`** | Fan out an array of `tasks` concurrently on the server (`maxConcurrency` default 4, max 16). Returns ordered per-task results (`answer` untruncated) plus aggregated `batchUsage` token & RMB cost summary. |
-| **`pool_status`** | Inspect active warm sessions in the pool (`key`, `sessionId`, `turns`, `busy`, `idleMs`, and cumulative `sessionUsage`). |
-| **`worker_info`** | Inspect server version (`2.5.0`), tier model mappings, timer defaults, and pool status. |
+| **`delegate_task`** | Delegate an atomic leaf task or Pass-2 KV-cached polish. Supports `task`, `cwd`, `context`, `sessionKey`, `mode` (`fast`\|`craft`\|`agent`), `tier` (`flash`\|`max`), `model`, `pureText` (legacy), `reasoningEffort`, `stallTimeoutMs`, `autoFailover`, `fresh`, `warnMs`, `forceMs`, `timeoutMs`. Returns `answer`, `toolCalls`, `elapsedMs`, `usage` (with `cacheHitRate`), `sessionUsage`, and `failoverFrom`. |
+| **`delegate_parallel`** | Fan out 2–4 concurrent tasks (up to 16) across distinct healthy direct Magpie routes. Returns ordered untruncated `results`, `routePlan`, `skippedRoutes`, `failovers`, and aggregated `batchUsage`. |
+| **`pool_status`** | Inspect active warm sessions (`key`, `mode`, `tools`, `model`, `sessionId`, `turns`, `busy`, `idleMs`, and cumulative `sessionUsage`). |
+| **`worker_info`** | Inspect server version (`3.0.0`), `workerIsolation` patch status, `modes` presets, live `magpieRoutes` credit status, and pool snapshot. |
 | **`reset_session`** | Evict and kill the process tree for a specific `sessionKey` (or clear the entire pool if omitted). |
 | **`echo`** | Quick connectivity health check. |
 
@@ -79,7 +77,8 @@ Persistent `dsh --profile sdk` Worker Processes
 
 ### 1. Prerequisites
 - **Node.js** `>= 18`
-- **DeepSeek Harness (`@deepseek-ai/dsh`)** installed with an `sdk` profile configured (`~/.dsh/profiles/sdk`).
+- **DeepSeek Harness (`@deepseek-ai/dsh`)** installed with an `sdk` profile (`~/.dsh/profiles/sdk`).
+- Optional: **Magpie** gateway CLI (`magpie quota --json`) for credit-aware multi-route spreading. You can customize direct routes directly in `MAGPIE_DIRECT_ROUTES` near the top of `server.mjs`.
 
 ### 2. Install Dependencies
 ```bash
@@ -101,16 +100,15 @@ Add `dsh-deepseek` to `~/.gemini/config/mcp_config.json` (or `~/.gemini/antigrav
         "POOL_MAX": "4",
         "PARALLEL_MAX": "4",
         "DEFAULT_WORKSPACE_CWD": "d:/agy"
-      }
+      },
+      "timeoutSeconds": 7200
     }
   }
 }
 ```
 
 ### 4. (Required for Auto-Delegation) Install the Global Orchestrator Plugin
-In **Google Antigravity 2.0**, loose files in `~/.gemini/config/rules/` are ignored after plugin migration—global rules **must** live inside an enabled plugin (`~/.gemini/config/plugins/<name>/rules/AGENTS.md`).
-
-Install the bundled `dsh-deepseek-delegator` plugin so Antigravity **proactively delegates without waiting to be asked**, **enforces multi-part decomposition via `delegate_parallel`** (`>120` lines or `>=2` modules), and **automatically switches to Multi-Wave Rolling Concurrency** on mega-tasks (`>4` units/maps/scenes, capping each worker turn at `1–2` units and running multiple waves of `delegate_parallel(4)` while reusing `worker-1`..`worker-4` `sessionKey`s to hit 98% KV cache without timing out):
+In **Google Antigravity 2.0**, global rules **must** live inside an enabled plugin (`~/.gemini/config/plugins/<name>/rules/AGENTS.md`):
 
 ```bash
 mkdir -p ~/.gemini/config/plugins/dsh-deepseek-delegator/rules
@@ -120,34 +118,28 @@ cp delegate-to-dsh.md ~/.gemini/config/plugins/dsh-deepseek-delegator/rules/AGEN
 
 ---
 
-## 🧪 Real-World Benchmark: 245 KB Single-File SVG Animation
+## 🧪 Live v3.0.0 Benchmarks
 
-In a live benchmark orchestrating a **245 KB multi-country picture-in-picture SVG animation** (*"Pelican cycling around the world inside hanging Polaroid photos with dynamic camera tracking"*):
-- **4 specialized DeepSeek workers** ran in parallel (`svg-pelican-hero`, `svg-photo-1-2`, `svg-photo-3-4`, `svg-frames-studio`).
-- **Total Token Throughput**: **6,413,000 Tokens** (`100,537` uncached input + `5,869,824` KV cache read + `442,639` output & reasoning tokens).
-- **KV Cache Hit Rate**: **`98.32%`**
-- **Total Official API Cost (Off-Peak)**: **¥1.99 CNY (~$0.27 USD)**!
+- **Prompt & Tool Isolation Audit**:
+  - Unpatched `dsh --profile sdk`: `~9,409` base input tokens (personal `AGENTS.md` + skills + 20+ tools).
+  - Patched `fast`/`craft` (`worker-clean.patch.yml` + `worker-pure.patch.yml`): **`161` input tokens**, **`tools: []`**, **`152` header bytes** (`-98.3%`).
+- **Two-Pass Craft + KV-Cached Polish E2E**:
+  - Pass-1 (`mode: "craft"`): `665` uncached input tokens on isolated `workbuddy/deepseek-v4.1-flash`.
+  - Pass-2 (`mode: "fast"`, same `sessionKey`): **`98.9%` KV cache hit** (`19,712` cacheRead vs `213` new input), **`¥0.027` CNY**.
+- **20-Era Procedural Film Multi-Wave Stress Test (5 Waves × 4 Workers = 20/20 OK)**:
+  - Generated **215 KB** of pure Canvas 2D + Web Audio code across 5 rolling waves, **`561,920` KV cache read tokens**, total cost **¥0.95 CNY**, zero timeouts after direct-route credit filtering.
 
 ---
 
 ## ✅ Built-In Verification Suite
 
-Run the included self-tests and E2E suites to verify your local DSH SDK runtime:
-
 ```bash
-# 1. Warm session memory reuse & token meter self-test
-npm run selftest
-
-# 2. Hard wall-clock timeout self-test (scaled to 1.2s)
-npm run test:timeout
-
-# 3. 3-tier timer ladder self-test (3s warn -> 6s force -> 25s cap)
-npm run test:ladder
-
-# 4. Full MCP stdio E2E suites
-npm run test:e2e
-npm run test:reuse
-npm run test:parallel
+npm run selftest       # Warm session reuse & token meter self-test
+npm run test:timeout   # Hard wall-clock timeout self-test
+npm run test:ladder    # 3-tier timer ladder self-test
+npm run test:e2e       # Full MCP stdio E2E
+npm run test:reuse     # SessionKey memory isolation & reuse E2E
+npm run test:parallel  # True parallel fan-out speedup E2E
 ```
 
 ---
@@ -159,14 +151,16 @@ npm run test:parallel
 | `DSH_NODE` | `process.execPath` | Path to Node.js binary used to spawn `dsh` |
 | `DSH_BIN` | `~/nodejs/node_modules/@deepseek-ai/dsh/lib/bin.js` | Path to `@deepseek-ai/dsh/lib/bin.js` |
 | `DSH_WORKER_PROFILE` | `sdk` | DSH profile name |
+| `DSH_WORKER_ISOLATE` | `1` (set `0` to disable) | Apply `worker-clean.patch.yml` / `worker-pure.patch.yml` isolation patches |
+| `MAGPIE_QUOTA_TTL_MS` | `60000` (60s) | Cache TTL for `magpie quota --json` credit checks |
 | `DEFAULT_WORKSPACE_CWD` | `d:\agy` or `process.cwd()` | Safe fallback workspace when `cwd` is omitted |
 | `PARALLEL_MAX` | `4` | Default concurrency for `delegate_parallel` (1–16) |
 | `POOL_MAX` | `max(4, PARALLEL_MAX)` | Maximum warm sessions retained in the LRU pool |
 | `POOL_TTL_MS` | `1800000` (30 min) | Idle session TTL before automatic eviction |
 | `MAX_TURNS` | `40` | Maximum turns per session before automatic recycle |
-| `DELEGATE_WARN_MS` | `900000` (15 min) | Tier-1 gentle convergence reminder threshold |
-| `DELEGATE_FORCE_MS` | `1500000` (25 min) | Tier-2 forced wrap-up threshold |
-| `DELEGATE_TIMEOUT_MS` | `1800000` (30 min) | Tier-3 hard kill timeout threshold |
+| `DELEGATE_WARN_MS` | `900000` (15 min) | Tier-1 gentle convergence reminder (`agent` mode) |
+| `DELEGATE_FORCE_MS` | `1500000` (25 min) | Tier-2 forced wrap-up command (`agent` mode) |
+| `DELEGATE_TIMEOUT_MS` | `1800000` (30 min) | Tier-3 hard kill timeout (`agent` mode) |
 
 ---
 

@@ -1,0 +1,15 @@
+# Pure single-turn code/text generation overlay for `fast` and `craft` modes (v3.0.0)
+# Disables disk/shell/web tools at the runtime level to eliminate ~6k tokens of tool schema bloat
+# and make accidental multi-turn tool loops physically impossible.
+- id: tool-bash
+  disabled: true
+- id: tool-pwsh
+  disabled: true
+- id: tool-fs
+  disabled: true
+- id: tool-fs-search
+  disabled: true
+- id: tool-jobs
+  disabled: true
+- id: tool-web
+  disabled: true

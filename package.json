@@ -1,6 +1,6 @@
 {
   "name": "dsh-deepseek-mcp",
-  "version": "2.5.0",
+  "version": "3.0.0",
   "type": "module",
   "description": "Persistent-session DeepSeek worker pool MCP server for Google Antigravity & AI IDEs, backed by DeepSeek Harness (DSH) SDK JSON-RPC with multi-worker parallel fan-out, 3-tier wall-clock timers, KV cache reuse, and real-time token/cost accounting.",
   "main": "server.mjs",
