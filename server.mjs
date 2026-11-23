@@ -7,8 +7,8 @@
 //     giving high-craft single-turn generation (`craft`) without agentic tool-loop runaway.
 //   - Physical worker profile isolation (`worker-clean.patch.yml` + `worker-pure.patch.yml`): strips personal
 //     ~/.dsh/AGENTS.md and irrelevant skills, cutting base input bloat from ~9.4k tokens down to ~520 tokens.
-//   - Stream-aware stall watchdog (`stallTimeoutMs`), single-turn completion gate, and automatic 1x failover
-//     onto another healthy Magpie route on stall/crash.
+//   - Step-activity stall watchdog (`stallTimeoutMs`), empty-reply & turn-error detection, and multi-hop failover
+//     across healthy Magpie routes on stall/crash/empty-reply.
 //   - Two-pass KV-cached craft + polish workflow: `fast` and `craft` share the same warm `sessionKey` pool bucket
 //     so Pass-2 targeted critique/polish hits ~95-98% KV cache (`cacheHitRate` reported on every response).
 //   - Magpie credit-aware direct route spreading (editable in `MAGPIE_DIRECT_ROUTES` below).
@@ -20,7 +20,9 @@ import { promisify } from 'node:util'
 import { randomUUID } from 'node:crypto'
 import { resolve as resolvePath, join as joinPath, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
+import http from 'node:http'
+import https from 'node:https'
 import { homedir } from 'node:os'
 
 const execFileAsync = promisify(execFile)
@@ -28,7 +30,8 @@ const HERE_DIR = dirname(fileURLToPath(import.meta.url))
 const CLEAN_PATCH = joinPath(HERE_DIR, 'worker-clean.patch.yml')
 const PURE_PATCH = joinPath(HERE_DIR, 'worker-pure.patch.yml')
 const ISOLATE_WORKER = process.env.DSH_WORKER_ISOLATE !== '0'
-const SERVER_VERSION = '3.0.0'
+const SERVER_VERSION = '3.1.0'
+const MAX_FAILOVERS = Math.max(0, Math.min(4, Number(process.env.MAX_FAILOVERS || 2)))
 
 const NODE_EXE = process.env.DSH_NODE || process.execPath
 const DEFAULT_DSH_BIN = joinPath(homedir(), 'nodejs/node_modules/@deepseek-ai/dsh/lib/bin.js').replace(/\\/g, '/')
@@ -50,23 +53,23 @@ const MODE_PRESETS = {
   fast: {
     tools: false,
     defaultEffort: 'low',
-    defaultStallMs: 60000,
-    defaultTimeoutMs: 120000,
+    defaultStallMs: 150000,
+    defaultTimeoutMs: 180000,
     singleStepGate: true,
-    desc: '极速纯输出（禁工具 + 浅思考，适合样板/配置/小片段/Pass-2 快速定点精修，10~25s）',
+    desc: '极速纯输出（禁工具 + 浅思考，适合样板/配置/小片段/Pass-2 快速定点精修，10~35s）',
   },
   craft: {
     tools: false,
     defaultEffort: 'low',
-    defaultStallMs: 120000,
-    defaultTimeoutMs: 240000,
+    defaultStallMs: 240000,
+    defaultTimeoutMs: 300000,
     singleStepGate: true,
-    desc: '精工纯输出甜品档（禁工具防死循环 + 隔离冗余上下文 + 高完整度代码/艺术渲染，20~60s；极难算法可显式传 reasoningEffort:"high"）',
+    desc: '精工纯输出甜品档（禁工具防死循环 + 隔离冗余上下文 + 高完整度代码/艺术渲染，20~90s；极难算法可显式传 reasoningEffort:"high"）',
   },
   agent: {
     tools: true,
     defaultEffort: 'high',
-    defaultStallMs: 120000,
+    defaultStallMs: 240000,
     defaultTimeoutMs: TURN_TIMEOUT,
     singleStepGate: false,
     desc: '完整自治代理（开启 shell/fs 工具 + 隔离个人 AGENTS.md，适合真实仓库排障与测试）',
@@ -85,21 +88,73 @@ const TIERS = {
 }
 
 // Magpie direct routes (bypassing routing group `auto/deepseek-v4.1-flash` during multi-way concurrency).
-// Note: `doubaowork-direct` (32k ctx / 4096 maxTokens) stalls under DSH's ~9.4k system prompt, so it is fallback-only (`dshPrimary: false`).
+// Note: `wps-lingxi` (slow streaming) and `trae-cn` (16k output cap) are kept as fallback-only (`dshPrimary: false`).
 const MAGPIE_DIRECT_ROUTES = [
-  { provider: 'workbuddy',         model: 'workbuddy/deepseek-v4.1-flash',                       minPct: 5, minAbs: 50, maxTokens: 128000, highCtx: true,  dshPrimary: true  },
-  { provider: 'wps-lingxi',        model: 'wps-lingxi/deepseek-v4.1-flash',                      minPct: 5, minAbs: 50, maxTokens: 393216, highCtx: true,  dshPrimary: true  },
-  { provider: 'trae-cn',           model: 'trae-cn/deepseek-v4.1-flash',                         minPct: 5, minAbs: 50, maxTokens: 16000,  highCtx: false, dshPrimary: true  },
-  { provider: 'doubaowork-direct', model: 'doubaowork-direct/person-deepseek-v4-1-flash-261017', minPct: 5, minAbs: 20, maxTokens: 4096,   highCtx: false, dshPrimary: false },
+  { provider: 'workbuddy',  model: 'workbuddy/deepseek-v4.1-flash',       minPct: 5, minAbs: 50, maxTokens: 128000, highCtx: true,  dshPrimary: true  },
+  { provider: 'dumate',     model: 'dumate/deepseek-v41-flash',           minPct: 5, minAbs: 50, maxTokens: 384000, highCtx: true,  dshPrimary: true  },
+  { provider: 'raccoon',    model: 'raccoon/sn-deepseek-v4-1-flash-1017', minPct: 5, minAbs: 50, maxTokens: 100000, highCtx: true,  dshPrimary: true  },
+  { provider: 'loomy',      model: 'loomy/DeepSeek-V4.1-Flash',           minPct: 5, minAbs: 50, maxTokens: 384000, highCtx: true,  dshPrimary: true  },
+  { provider: 'wps-lingxi', model: 'wps-lingxi/deepseek-v4.1-flash',      minPct: 5, minAbs: 50, maxTokens: 393216, highCtx: true,  dshPrimary: false },
+  { provider: 'trae-cn',    model: 'trae-cn/deepseek-v4.1-flash',         minPct: 5, minAbs: 50, maxTokens: 16000,  highCtx: false, dshPrimary: false },
 ]
 const MAGPIE_MAX_ROUTES = [
-  { provider: 'trae-cn',           model: 'trae-cn/deepseek-v4.1-flash-max',                     minPct: 5, minAbs: 50, maxTokens: 64000,  highCtx: true },
-  { provider: 'wps-lingxi',        model: 'wps-lingxi/deepseek-v4.1-flash',                      minPct: 5, minAbs: 50, maxTokens: 393216, highCtx: true },
-  { provider: 'workbuddy',         model: 'workbuddy/deepseek-v4.1-flash',                       minPct: 5, minAbs: 50, maxTokens: 128000, highCtx: true },
+  { provider: 'workbuddy',  model: 'workbuddy/deepseek-v4.1-flash',       minPct: 5, minAbs: 50, maxTokens: 128000, highCtx: true, dshPrimary: true  },
+  { provider: 'dumate',     model: 'dumate/deepseek-v41-flash',           minPct: 5, minAbs: 50, maxTokens: 384000, highCtx: true, dshPrimary: true  },
+  { provider: 'loomy',      model: 'loomy/DeepSeek-V4.1-Flash',           minPct: 5, minAbs: 50, maxTokens: 384000, highCtx: true, dshPrimary: true  },
+  { provider: 'trae-cn',    model: 'trae-cn/deepseek-v4.1-flash-max',     minPct: 5, minAbs: 50, maxTokens: 64000,  highCtx: true, dshPrimary: true  },
+  { provider: 'wps-lingxi', model: 'wps-lingxi/deepseek-v4.1-flash',      minPct: 5, minAbs: 50, maxTokens: 393216, highCtx: true, dshPrimary: false },
 ]
 const QUOTA_CACHE_TTL_MS = Number(process.env.MAGPIE_QUOTA_TTL_MS || 60000)
-let _quotaCache = { ts: 0, entries: null, error: null }
+let _quotaCache = { ts: 0, entries: null, error: null, source: null }
 let _routeRR = 0
+
+function resolveMagpieGateway() {
+  let url = (process.env.MAGPIE_GATEWAY_URL || '').trim()
+  if (!url) {
+    try {
+      const yaml = readFileSync(joinPath(homedir(), '.dsh', 'settings.yaml'), 'utf8')
+      const block = yaml.match(/magpie:\s*\r?\n(?:[ \t]+.*\r?\n)*/)?.[0] || yaml
+      const m = block.match(/^\s*baseURL:\s*(https?:\/\/[^\s#]+)/m)
+      if (m) url = m[1].trim()
+    } catch {}
+  }
+  url = url.replace(/\/+$/, '').replace(/\/v1$/i, '')
+
+  let key = (process.env.MAGPIE_GATEWAY_KEY || '').trim()
+  if (!key) {
+    try {
+      const envTxt = readFileSync(joinPath(homedir(), '.dsh', '.env'), 'utf8')
+      const m = envTxt.match(/^\s*MAGPIE_GATEWAY_KEY\s*=\s*(.+)$/m)
+      if (m) key = m[1].trim().replace(/^['"]|['"]$/g, '')
+    } catch {}
+  }
+  return { url, key }
+}
+
+function httpGetJson(urlStr, headers = {}, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr)
+    const mod = u.protocol === 'https:' ? https : http
+    const req = mod.request(u, { method: 'GET', headers, timeout: timeoutMs }, (res) => {
+      let body = ''
+      res.setEncoding('utf8')
+      res.on('data', (chunk) => { body += chunk })
+      res.on('end', () => {
+        if ((res.statusCode || 0) < 200 || (res.statusCode || 0) >= 300) {
+          return reject(new Error(`HTTP ${res.statusCode}: ${body.slice(0, 200)}`))
+        }
+        try {
+          resolve(JSON.parse(body))
+        } catch (e) {
+          reject(new Error(`invalid JSON from ${u.origin}${u.pathname}: ${e.message}`))
+        }
+      })
+    })
+    req.on('timeout', () => req.destroy(new Error(`timeout after ${timeoutMs}ms`)))
+    req.on('error', reject)
+    req.end()
+  })
+}
 
 function pickPrimaryQuotaWindow(windows) {
   if (!Array.isArray(windows) || !windows.length) return null
@@ -129,16 +184,29 @@ async function fetchMagpieQuotas(force = false) {
   if (!force && _quotaCache.entries && now - _quotaCache.ts < QUOTA_CACHE_TTL_MS) {
     return _quotaCache
   }
+  const { url, key } = resolveMagpieGateway()
+  if (url) {
+    try {
+      const headers = key ? { Authorization: `Bearer ${key}` } : {}
+      const parsed = await httpGetJson(`${url}/v1/magpie/quotas`, headers, 10000)
+      const entries = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.data) ? parsed.data : null)
+      if (!entries) throw new Error('no quota array in gateway response')
+      _quotaCache = { ts: now, entries, error: null, source: url }
+      return _quotaCache
+    } catch (e) {
+      log(`magpie gateway quota check failed (${url}):`, String(e?.message || e))
+    }
+  }
   try {
     const { stdout } = await execFileAsync('magpie', ['quota', '--json'], { timeout: 15000, windowsHide: true })
     const startIdx = stdout.indexOf('[')
     if (startIdx < 0) throw new Error('no JSON array in magpie quota output')
     const entries = JSON.parse(stdout.slice(startIdx))
-    _quotaCache = { ts: now, entries, error: null }
+    _quotaCache = { ts: now, entries, error: null, source: 'local-cli' }
     return _quotaCache
   } catch (e) {
     log('magpie quota check failed:', String(e))
-    _quotaCache = { ts: now, entries: _quotaCache.entries, error: String(e) }
+    _quotaCache = { ts: now, entries: _quotaCache.entries, error: String(e), source: _quotaCache.source }
     return _quotaCache
   }
 }
@@ -339,17 +407,15 @@ class SdkSession {
     }
   }
   _onNotif(method, p) {
+    this.lastActivityAt = Date.now()
     if (method === 'session.status') {
-      const st = String(p.status); this.lastStatus = st; this.lastActivityAt = Date.now()
+      const st = String(p.status); this.lastStatus = st
       if (/running/i.test(st)) this.sawRunning = true
       else if (this.sawRunning && this.doneResolve && /idle|done|stop|complete|error|fail/i.test(st)) {
         const r = this.doneResolve; this.doneResolve = null; r(st)
       }
     } else if (method === 'session.event') {
       const ev = p.event || {}
-      if (ev.type === 'step/start' || ev.type === 'assistant/message' || ev.type === 'assistant/attempt' || ev.type === 'tool/call' || ev.type === 'step/end' || ev.type === 'turn/end') {
-        this.lastActivityAt = Date.now()
-      }
       if (ev.type === 'assistant/message') {
         const content = ev.data?.message?.content
         if (Array.isArray(content)) {
@@ -558,7 +624,21 @@ async function delegateOnce({ task, cwd, context, sessionKey, tier, mode, model:
     try {
       await s.start()
       const r = await s.runTurn(text, tmo, hooks)
-      return { ok: r.status !== 'error', key: null, sessionId: s.sessionId, reused: false, ...base, status: r.status, elapsedMs: r.elapsedMs, usage: r.usage, answer: r.answer, toolCalls: r.toolCalls }
+      const emptyReply = r.status !== 'error' && !r.answer && r.toolCalls.length === 0
+      const ok = r.status !== 'error' && !emptyReply
+      return {
+        ok,
+        ...(emptyReply ? { emptyReply: true, timedOut: false, stalled: false, error: 'empty reply from model (likely reasoning exhausted max_tokens or upstream truncation)' } : {}),
+        key: null,
+        sessionId: s.sessionId,
+        reused: false,
+        ...base,
+        status: r.status,
+        elapsedMs: r.elapsedMs,
+        usage: r.usage,
+        answer: r.answer,
+        toolCalls: r.toolCalls,
+      }
     } catch (e) {
       return { ok: false, timedOut: !!e.timedOut, stalled: !!e.stalled, key: null, sessionId: s.sessionId, reused: false, ...base, error: String(e) }
     } finally { s.kill() }
@@ -600,9 +680,34 @@ async function delegateOnce({ task, cwd, context, sessionKey, tier, mode, model:
   rec.busy = true; rec.lastUsed = Date.now()
   try {
     const r = await rec.sess.runTurn(text, tmo, hooks)
+    const emptyReply = r.status !== 'error' && !r.answer && r.toolCalls.length === 0
+    const ok = r.status !== 'error' && !emptyReply
+    if (emptyReply) {
+      const sid = rec.sess.sessionId
+      try { rec.sess.kill() } catch {}
+      pool.delete(key)
+      return {
+        ok: false,
+        emptyReply: true,
+        timedOut: false,
+        stalled: false,
+        key: sessionKey,
+        sessionId: sid,
+        reused,
+        turns: rec.turns,
+        ...base,
+        status: r.status,
+        elapsedMs: r.elapsedMs,
+        usage: r.usage,
+        sessionUsage: r.sessionUsage,
+        answer: r.answer,
+        toolCalls: r.toolCalls,
+        error: 'empty reply from model (likely reasoning exhausted max_tokens or upstream truncation)',
+      }
+    }
     rec.turns++
     return {
-      ok: r.status !== 'error',
+      ok,
       key: sessionKey,
       sessionId: rec.sess.sessionId,
       reused,
@@ -625,19 +730,34 @@ async function delegateOnce({ task, cwd, context, sessionKey, tier, mode, model:
   }
 }
 
+const isRetriableFailure = (r) => !!(r && (r.stalled || r.timedOut || r.emptyReply || /sdk child closed|rpc timeout|session dead|empty reply/i.test(String(r.error || ''))))
+
 async function delegate(opts) {
   const autoFailover = opts.autoFailover !== false
-  const res = await delegateOnce(opts)
-  if (res.ok || !autoFailover || opts._noRetry) return res
-  // Only auto-failover when route stalled/timed out/crashed and caller did NOT explicitly pin a model
-  const retriable = res.stalled || res.timedOut || /sdk child closed|rpc timeout|session dead/i.test(String(res.error || ''))
-  if (!retriable || opts._pinnedByCaller) return res
+  let res = await delegateOnce(opts)
+  if (res.ok || !autoFailover || opts._pinnedByCaller || !isRetriableFailure(res)) return res
+
   const tierName = TIERS[opts.tier] ? opts.tier : 'flash'
-  const fallbackModel = await pickFallbackModel(tierName, new Set([res.model]))
-  if (!fallbackModel) return res
-  log('auto-failover triggered:', res.model, '->', fallbackModel, 'reason=', res.error)
-  const retry = await delegateOnce({ ...opts, model: fallbackModel, fresh: true, _noRetry: true })
-  return { ...retry, failoverFrom: { model: res.model, error: res.error, stalled: !!res.stalled } }
+  const tried = new Set([res.model])
+  const failoverChain = []
+
+  for (let hop = 0; hop < MAX_FAILOVERS; hop++) {
+    const fallbackModel = await pickFallbackModel(tierName, tried)
+    if (!fallbackModel) break
+    log('auto-failover triggered:', res.model, '->', fallbackModel, 'reason=', res.error)
+    failoverChain.push({
+      model: res.model,
+      error: res.error,
+      stalled: !!res.stalled,
+      emptyReply: !!res.emptyReply,
+    })
+    tried.add(fallbackModel)
+    res = await delegateOnce({ ...opts, model: fallbackModel, fresh: true })
+    if (res.ok || !isRetriableFailure(res)) break
+  }
+
+  if (!failoverChain.length) return res
+  return { ...res, failoverFrom: failoverChain[failoverChain.length - 1], failoverChain }
 }
 
 // Run `fn` over items with a concurrency limit; preserves result order.
@@ -661,6 +781,8 @@ server.tool('worker_info', '返回 worker 配置、三档 mode、隔离补丁状
     content: [{ type: 'text', text: JSON.stringify({
       version: SERVER_VERSION,
       profile: PROFILE,
+      magpieGatewayUrl: resolveMagpieGateway().url || null,
+      quotaSource: _quotaCache.source || null,
       workerIsolation: {
         enabled: ISOLATE_WORKER,
         cleanPatchExists: existsSync(CLEAN_PATCH),
@@ -709,12 +831,12 @@ server.tool(
     model: z.string().optional().describe('可选：显式指定 Magpie 独立路线模型 ID（省略则自动按积分挑选健康独立路线）'),
     pureText: z.boolean().optional().describe('兼容旧参数：为 true 且未指定 mode 时自动映射到 fast（low 思考）或 craft（high 思考）'),
     reasoningEffort: z.enum(['low', 'high', 'max']).optional().describe('思考深度：省略则按 mode 默认（fast=low, craft/agent=high）'),
-    stallTimeoutMs: z.number().optional().describe('单步失速看门狗超时（毫秒），超时无进展即判失速并触发自动故障转移'),
-    autoFailover: z.boolean().optional().describe('默认 true：遇失速/超时/子进程崩时自动切到另一条健康 Magpie 路线重试一次（显式传 model 时不覆盖）'),
+    stallTimeoutMs: z.number().optional().describe('单步活动看门狗超时（毫秒；默认 fast=150s, craft/agent=240s），超时无进展即判失速并触发自动故障转移'),
+    autoFailover: z.boolean().optional().describe('默认 true：遇失速/超时/空回复/子进程崩时自动切到健康 Magpie 路线重试（最多 2 次，显式传 model 时不覆盖）'),
     fresh: z.boolean().optional().describe('为 true 时强制重开会话（清空记忆）'),
     warnMs: z.number().optional().describe('agent 模式提醒阈值（毫秒），默认 900000=15 分钟'),
     forceMs: z.number().optional().describe('agent 模式强制收尾阈值（毫秒），默认 1500000=25 分钟'),
-    timeoutMs: z.number().optional().describe('硬超时（毫秒）；省略则按 mode 默认（fast=120s, craft=300s, agent=1800s）'),
+    timeoutMs: z.number().optional().describe('硬超时（毫秒）；省略则按 mode 默认（fast=180s, craft=300s, agent=1800s）'),
   },
   async ({ task, cwd, context, sessionKey, mode, tier, model, pureText, reasoningEffort, stallTimeoutMs, autoFailover, fresh, warnMs, forceMs, timeoutMs }, extra) => {
     const notify = (msg) => { try { extra?.sendNotification?.({ method: 'notifications/progress', params: { progressToken: extra?._meta?.progressToken, progress: 1, total: 1, message: msg } }) } catch {} }

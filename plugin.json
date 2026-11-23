@@ -1,6 +1,6 @@
 {
   "name": "dsh-deepseek-delegator",
   "displayName": "DeepSeek 智能拆单外包编排器",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "全局强制外包与拆单编排规则：将 Antigravity 主模型作为总架构师（大脑），默认主动将任务拆解并通过 dsh-deepseek MCP 的 delegate_parallel / delegate_task 并发外包给 DeepSeek worker 池执行。"
 }
