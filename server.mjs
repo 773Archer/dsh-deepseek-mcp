@@ -34,8 +34,12 @@ const SERVER_VERSION = '3.1.0'
 const MAX_FAILOVERS = Math.max(0, Math.min(4, Number(process.env.MAX_FAILOVERS || 2)))
 
 const NODE_EXE = process.env.DSH_NODE || process.execPath
-const DEFAULT_DSH_BIN = joinPath(homedir(), 'nodejs/node_modules/@deepseek-ai/dsh/lib/bin.js').replace(/\\/g, '/')
-const DSH_BIN = process.env.DSH_BIN || (existsSync(DEFAULT_DSH_BIN) ? DEFAULT_DSH_BIN : 'C:/Users/24537/nodejs/node_modules/@deepseek-ai/dsh/lib/bin.js')
+const DSH_BIN_CANDIDATES = [
+  joinPath(homedir(), 'nodejs/node_modules/@deepseek-ai/dsh/lib/bin.js'),
+  ...(process.env.APPDATA ? [joinPath(process.env.APPDATA, 'npm/node_modules/@deepseek-ai/dsh/lib/bin.js')] : []),
+  '/usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js',
+].map((p) => p.replace(/\\/g, '/'))
+const DSH_BIN = process.env.DSH_BIN || DSH_BIN_CANDIDATES.find((p) => existsSync(p)) || DSH_BIN_CANDIDATES[0]
 const PROFILE = process.env.DSH_WORKER_PROFILE || 'sdk'
 const TURN_TIMEOUT = Number(process.env.DELEGATE_TIMEOUT_MS || 1800000) // hard cap 30 min
 const WARN_TIMEOUT = Number(process.env.DELEGATE_WARN_MS || 900000)     // reminder 15 min
@@ -47,7 +51,7 @@ const PARALLEL_MAX = Number(process.env.PARALLEL_MAX || 4) // default concurrenc
 const POOL_MAX = Math.max(Number(process.env.POOL_MAX || 4), PARALLEL_MAX)
 const POOL_TTL = Number(process.env.POOL_TTL_MS || 1800000)
 const MAX_TURNS = Number(process.env.MAX_TURNS || 40)
-const DEFAULT_WORKSPACE = process.env.DEFAULT_WORKSPACE_CWD || (existsSync('d:\\agy') ? 'd:\\agy' : process.cwd())
+const DEFAULT_WORKSPACE = process.env.DEFAULT_WORKSPACE_CWD || homedir()
 
 const MODE_PRESETS = {
   fast: {

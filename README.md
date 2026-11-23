@@ -99,7 +99,7 @@ Add `dsh-deepseek` to `~/.gemini/config/mcp_config.json` (or `~/.gemini/antigrav
       "env": {
         "POOL_MAX": "4",
         "PARALLEL_MAX": "4",
-        "DEFAULT_WORKSPACE_CWD": "d:/agy"
+        "DEFAULT_WORKSPACE_CWD": "/path/to/your/workspace"
       },
       "timeoutSeconds": 7200
     }
@@ -153,7 +153,7 @@ npm run test:parallel  # True parallel fan-out speedup E2E
 | `DSH_WORKER_PROFILE` | `sdk` | DSH profile name |
 | `DSH_WORKER_ISOLATE` | `1` (set `0` to disable) | Apply `worker-clean.patch.yml` / `worker-pure.patch.yml` isolation patches |
 | `MAGPIE_QUOTA_TTL_MS` | `60000` (60s) | Cache TTL for `magpie quota --json` credit checks |
-| `DEFAULT_WORKSPACE_CWD` | `d:\agy` or `process.cwd()` | Safe fallback workspace when `cwd` is omitted |
+| `DEFAULT_WORKSPACE_CWD` | `os.homedir()` | Safe fallback workspace when `cwd` is omitted |
 | `PARALLEL_MAX` | `4` | Default concurrency for `delegate_parallel` (1–16) |
 | `POOL_MAX` | `max(4, PARALLEL_MAX)` | Maximum warm sessions retained in the LRU pool |
 | `POOL_TTL_MS` | `1800000` (30 min) | Idle session TTL before automatic eviction |

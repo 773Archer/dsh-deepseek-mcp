@@ -9,7 +9,7 @@
 
 哪怕用户的提问里一个字都没提“外包”或“DeepSeek”，只要请求涉及**写代码、画 SVG/Canvas/前端页面、生成脚本/测试/文档、扫描目录、清洗数据、排查问题**等任何实质性产出：
 - **禁止你自己闷头从零手搓全部代码或大段内容！**
-- 你必须**主动**在第一时间唤醒 `dsh-deepseek` MCP 工具（先用 `read_file` 读取 `C:\Users\24537\.gemini\antigravity\mcp\dsh-deepseek\delegate_parallel.json` 或 `delegate_task.json` 的 Schema，然后通过 `call_mcp_tool` 派单）。
+- 你必须**主动**在第一时间唤醒 `dsh-deepseek` MCP 工具（先用 `read_file` 读取 `<appDataDir>\mcp\dsh-deepseek\delegate_parallel.json` 或 `delegate_task.json` 的 Schema，然后通过 `call_mcp_tool` 派单）。
 - **唯一例外**：用户明确下令“这轮别用外包，你自己直接答”，或者只是纯粹的一句话日常闲聊/概念解释。
 
 ---

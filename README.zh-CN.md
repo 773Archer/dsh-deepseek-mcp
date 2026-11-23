@@ -99,7 +99,7 @@ npm install
       "env": {
         "POOL_MAX": "4",
         "PARALLEL_MAX": "4",
-        "DEFAULT_WORKSPACE_CWD": "d:/agy"
+        "DEFAULT_WORKSPACE_CWD": "/path/to/your/workspace"
       },
       "timeoutSeconds": 7200
     }
@@ -153,7 +153,7 @@ npm run test:parallel  # 服务端多路并发加速比测试
 | `DSH_WORKER_PROFILE` | `sdk` | DSH 运行 profile 名称 |
 | `DSH_WORKER_ISOLATE` | `1`（设 `0` 可关闭） | 是否自动挂接 `worker-clean.patch.yml` / `worker-pure.patch.yml` 隔离补丁 |
 | `MAGPIE_QUOTA_TTL_MS` | `60000` (60 秒) | `magpie quota --json` 积分查询缓存时间 |
-| `DEFAULT_WORKSPACE_CWD` | `d:\agy` 或 `process.cwd()` | 当未传 `cwd` 或检测到默认目录落在 IDE 安装目录时的安全回退工作区 |
+| `DEFAULT_WORKSPACE_CWD` | `os.homedir()` | 当未传 `cwd` 或检测到默认目录落在 IDE 安装目录时的安全回退工作区 |
 | `PARALLEL_MAX` | `4` | `delegate_parallel` 默认并发上限（1–16） |
 | `POOL_MAX` | `max(4, PARALLEL_MAX)` | 常驻会话池最大保留会话数（LRU 淘汰） |
 | `POOL_TTL_MS` | `1800000` (30 分钟) | 空闲会话自动回收时间 |
